@@ -4,7 +4,7 @@ ProtoTip.AI is a Unity Editor agent that uses OpenAI to plan and scaffold a play
 
 ## Installation
 
-Just copy the ProtoTipAI folder and all of its content to the Assets folder of your project.
+Copy the `ProtoTipAI` folder into your project's `Assets` folder.
 
 ## Requirements
 
@@ -13,25 +13,28 @@ Just copy the ProtoTipAI folder and all of its content to the Assets folder of y
 
 ## Quick Start
 
-Open menu Proto -> Setup:
--Add OpenAI API Token and select model (i'm testing 5.2)
--Add Project goal
--Refresh Summary
--Save and close
-Open menu Proto -> Chat and align it with Inspector tab:
--Set the Plan Prompt
--Press Generate Plan and wait for the agent to end asking the plan to the AI. It will create a Plan folder and capture some MD files with inventory of different items for the Project.
--Press Create Feature Requests to generate all the feature requests of the plan.
--Press Apply Plan and wait it to finish.
--Should end without Script errors, but you can press Fix Step with 1 or more fix step iterations
--Wait for the end of the implementation
-You should end with a Project folder that includes project folder structure, Scripts, Prefabs and Scenes skeletons, but some feature requests maybe need to be applied to be finished, so you can open menu Proto -> Plan Tracking and use drop down filters to find blocked feature requests that need retry or re-do. Using the different Plan Stages buttons on the Proto Chat tab should try only on pending (todo/blocked) feature requests.
+1. Open menu `Proto -> Setup`:
+   - Add OpenAI API Token and select model (I'm testing 5.2)
+   - Add Project goal
+   - Refresh Summary
+   - Save and close
+2. Open menu `Proto -> Chat` and dock it next to the Inspector tab:
+   - Set the Plan Prompt
+   - Press Generate Plan and wait for the agent to finish asking the plan to the AI. It will create a Plan folder and capture MD files with inventory of different items for the Project.
+   - Press Create Feature Requests to generate all the feature requests of the plan.
+   - Press Apply Plan and wait for it to finish.
+   - It should end without script errors, but you can press Fix Step with 1 or more fix step iterations.
+   - Wait for the end of the implementation.
+
+### After Apply Plan
+
+You should end with a Project folder that includes project folder structure, Scripts, Prefabs and Scenes skeletons. Some feature requests may need to be applied again, so open menu `Proto -> Plan Tracking` and use drop down filters to find blocked feature requests that need retry or re-do. Using the different Plan Stages buttons on the Proto Chat tab should try only on pending (todo/blocked) feature requests.
 
 I've been developing this agent, and you will have a playable prototype at the end, but with basic shapes, nothing fancy. It all depends on prompts, and you need to review variables and hydrate them on scenes and/or prefabs.
 
-This Agent have a lot of stuff to be implemented, and i realised i cannot continue this Project alone, and Unity team started to add the AI directly to Unity so i'm not sure what's the future for this. I do feel i was more advanced than Unity's team ;) but this is far from being even a prototype.
+This Agent has a lot of stuff to be implemented, and I realised I cannot continue this project alone. The Unity team started to add AI directly to Unity, so I'm not sure what's the future for this. I do feel I was more advanced than Unity's team ;) but this is far from being even a prototype.
 
-If you want to collaborate, i will be really happy to hear from you.
+If you want to collaborate, I will be really happy to hear from you.
 
 ## License
 
