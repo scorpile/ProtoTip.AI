@@ -1,0 +1,51 @@
+PROTO TIP AI NON-COMMERCIAL LICENSE
+Version 1.0
+
+Copyright (c) 2026 ProtoTip.AI
+
+This license is a non-commercial, source-available license. It is NOT an
+open-source license as defined by the Open Source Initiative (OSI).
+
+1. Definitions
+   "Software" means the code and content in this repository, including any
+   associated documentation and assets.
+   "You" means any person or entity exercising rights under this License.
+   "Commercial Use" means any use primarily intended for or directed toward
+   commercial advantage or monetary compensation, including offering the
+   Software as a paid product or service, or using it in a commercial product.
+
+2. Grant of Rights (Non-Commercial)
+   Subject to the terms of this License, You are granted a worldwide,
+   non-exclusive, non-transferable, revocable license to:
+   a) view and use the Software for non-commercial purposes;
+   b) modify the Software for non-commercial purposes; and
+   c) contribute improvements back to this repository.
+
+3. Restrictions
+   You may NOT:
+   a) use the Software for Commercial Use;
+   b) sell, license, sublicense, or monetize the Software or any derivative;
+   c) redistribute the Software or any derivative in whole or in part;
+   d) create a commercial product or service derived from the Software; or
+   e) remove or alter any copyright or license notices.
+
+4. Contributions
+   By submitting contributions to this repository, You grant the maintainer
+   a perpetual, worldwide, non-exclusive, royalty-free license to use,
+   reproduce, modify, and distribute Your contributions as part of the
+   Software.
+
+5. Termination
+   This License terminates automatically if You breach any term. Upon
+   termination, You must cease all use of the Software and delete all copies.
+
+6. Disclaimer of Warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+7. Limitation of Liability
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+   ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
