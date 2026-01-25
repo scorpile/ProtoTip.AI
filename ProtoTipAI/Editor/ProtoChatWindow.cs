@@ -24,13 +24,12 @@ namespace ProtoTipAI.Editor
         private const int MaxPrefabIndexEntries = 50;
         private const int MaxSceneIndexEntries = 40;
         private const int MaxAssetIndexEntries = 60;
-        private const string PlanRawFileName = "PlanRaw.json";
-
         private static readonly Regex NamespaceRegex = new Regex(@"^\s*namespace\s+([A-Za-z0-9_.]+)", RegexOptions.Compiled);
         private static readonly Regex TypeRegex = new Regex(@"\b(?:(public|internal)\s+)?(?:static\s+|abstract\s+|sealed\s+|partial\s+)*\b(class|struct|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.Compiled);
         private static readonly Regex MethodRegex = new Regex(@"\bpublic\s+(?:static\s+|virtual\s+|override\s+|abstract\s+|sealed\s+|async\s+)*([A-Za-z0-9_<>,\[\]\s]+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)", RegexOptions.Compiled);
         private static readonly Regex PropertyRegex = new Regex(@"\bpublic\s+([A-Za-z0-9_<>,\[\]\s]+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*(get|set)", RegexOptions.Compiled);
         private static readonly Regex FieldRegex = new Regex(@"\bpublic\s+([A-Za-z0-9_<>,\[\]\s]+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(=|;)", RegexOptions.Compiled);
+        private static readonly Regex IdentifierRegex = new Regex(@"^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.Compiled);
 
         private readonly List<ProtoChatMessage> _messages = new List<ProtoChatMessage>();
         private Vector2 _scroll;
@@ -51,6 +50,33 @@ namespace ProtoTipAI.Editor
         private bool _isApplyingPlan;
         private bool _isApplyingStage;
         private string _toolStatus = string.Empty;
+        private string _operationProgressLabel = string.Empty;
+        private int _operationProgressCurrent;
+        private int _operationProgressTotal;
+        private enum ProtoToolType
+        {
+            ReadFile,
+            WriteFile,
+            ListDirectory,
+            SearchText
+        }
+
+        private static readonly string[] ToolLabels =
+        {
+            "Read File",
+            "Write File",
+            "List Folder",
+            "Search Text"
+        };
+
+        private ProtoToolType _selectedToolType;
+        private string _toolFilePath = string.Empty;
+        private string _toolContent = string.Empty;
+        private string _toolSearchTerm = string.Empty;
+        private bool _toolIsRunning;
+        private string _toolExecutionStatus = string.Empty;
+        private string[] _diagnostics = Array.Empty<string>();
+        private double _lastDiagnosticsRefresh;
         private ProtoGenerationPlan _cachedPlan;
         private ProtoPhasePlan _cachedPhasePlan;
         private string[] _phaseLabels = Array.Empty<string>();
@@ -69,6 +95,51 @@ namespace ProtoTipAI.Editor
         private static bool _isSceneLayoutRunning;
         private bool _isFixingErrors;
         private int _fixPassIterations = 2;
+        private HashSet<string> _lastFixPassTargets;
+        private string _lastFixPassLabel = string.Empty;
+        private bool _isAgentLoopActive;
+        private int _agentMaxIterations = 6;
+        private const int AgentMaxToolOutputChars = 2400;
+        private const int AgentMaxHistoryEntries = 6;
+        private readonly List<string> _agentHistory = new List<string>();
+        private string _lastAgentGoal;
+        private readonly Dictionary<string, AgentReadSnapshot> _agentReadMemory = new Dictionary<string, AgentReadSnapshot>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _agentToolCallHistory = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private bool _chatHistoryDirty;
+        private bool _chatHistorySaveQueued;
+        private const int MaxChatHistoryMessages = 160;
+        private const string SessionPrefsKey = "ProtoTipAI.LastChatSessionId";
+        private const int SessionCompactionThreshold = 60;
+        private const int SessionCompactionKeepMessages = 20;
+        private const int SessionCompactionMaxChars = 12000;
+        private readonly List<ProtoChatSessionInfo> _sessionIndex = new List<ProtoChatSessionInfo>();
+        private string _sessionId;
+        private string _sessionTitle;
+        private long _sessionCreatedAt;
+        private long _sessionUpdatedAt;
+        private string _sessionSummary;
+        private int _sessionSelectionIndex = -1;
+        private bool _showSessionSummary;
+        private bool _isCompactingSession;
+        private Vector2 _planPromptScroll;
+        private Vector2 _inputScroll;
+        private static GUIStyle _multiLineTextAreaStyle;
+
+        private static GUIStyle MultiLineTextAreaStyle
+        {
+            get
+            {
+                if (_multiLineTextAreaStyle == null)
+                {
+                    _multiLineTextAreaStyle = new GUIStyle(EditorStyles.textArea)
+                    {
+                        wordWrap = true
+                    };
+                }
+
+                return _multiLineTextAreaStyle;
+            }
+        }
 
         [MenuItem("Proto/Chat")]
         public static void ShowWindow()
@@ -76,45 +147,84 @@ namespace ProtoTipAI.Editor
             var inspectorType = typeof(EditorWindow).Assembly.GetType("UnityEditor.InspectorWindow");
             if (inspectorType != null)
             {
-                GetWindow<ProtoChatWindow>("Proto Chat", false, new[] { inspectorType });
+                var window = GetWindow<ProtoChatWindow>("Proto Chat", false, new[] { inspectorType });
+                window.minSize = new Vector2(520f, 360f);
             }
             else
             {
-                GetWindow<ProtoChatWindow>("Proto Chat");
+                var window = GetWindow<ProtoChatWindow>("Proto Chat");
+                window.minSize = new Vector2(520f, 360f);
             }
+        }
+
+        internal static ProtoChatWindow FindWindow()
+        {
+            var windows = Resources.FindObjectsOfTypeAll<ProtoChatWindow>();
+            if (windows == null || windows.Length == 0)
+            {
+                return null;
+            }
+
+            return windows[0];
         }
 
         private void OnEnable()
         {
             RestorePlanFromDisk();
+            RestoreChatHistoryFromDisk();
+            _diagnostics = CollectDiagnostics();
+            _lastDiagnosticsRefresh = EditorApplication.timeSinceStartup;
+            CheckApiWaitTimeout(true);
+        }
+
+        private void OnDisable()
+        {
+            SaveChatHistoryIfDirty();
         }
 
         private void OnGUI()
         {
-            DrawHeader();
-            DrawContextOptions();
-            DrawAgentTools();
+            DrawChatPanel();
+        }
+
+        internal void DrawChatPanel()
+        {
+            CheckApiWaitTimeout(false);
+            DrawHeader(true);
             DrawChatHistory();
             DrawInputArea();
         }
 
-        private void DrawHeader()
+        internal void DrawControlPanel()
         {
+            CheckApiWaitTimeout(false);
+            DrawHeader(false);
+            DrawSessionPanel();
+            DrawContextOptions();
+            DrawDiagnosticsPanel();
+            DrawAgentTools();
+            DrawToolPanel();
+        }
+
+        private void DrawHeader(bool includeClear)
+        {
+            var settings = ProtoProviderSettings.GetSnapshot();
             using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
             {
-                GUILayout.Label("OpenAI", EditorStyles.toolbarButton);
+                GUILayout.Label(settings.Provider.DisplayName, EditorStyles.toolbarButton);
                 GUILayout.FlexibleSpace();
-                GUILayout.Label($"Model: {ProtoOpenAISettings.GetModel()}", EditorStyles.miniLabel);
-                if (GUILayout.Button("Clear", EditorStyles.toolbarButton))
+                GUILayout.Label($"Model: {settings.Model}", EditorStyles.miniLabel);
+                if (includeClear && GUILayout.Button("New Session", EditorStyles.toolbarButton))
                 {
-                    _messages.Clear();
-                    _status = string.Empty;
+                    ClearChatHistory();
                 }
             }
 
-            if (!ProtoOpenAISettings.HasToken())
+            if (string.IsNullOrWhiteSpace(settings.ApiKey))
             {
-                EditorGUILayout.HelpBox("Missing OpenAI token. Open Setup to configure.", MessageType.Warning);
+                EditorGUILayout.HelpBox(
+                    $"Missing API key for {settings.Provider.DisplayName}. Open Setup to configure.",
+                    MessageType.Warning);
                 if (GUILayout.Button("Open Setup"))
                 {
                     ProtoSetupWindow.ShowWindow();
@@ -143,6 +253,110 @@ namespace ProtoTipAI.Editor
             }
         }
 
+        private void DrawSessionPanel()
+        {
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+            {
+                EditorGUILayout.LabelField("Session", EditorStyles.boldLabel);
+                var title = string.IsNullOrWhiteSpace(_sessionTitle) ? "Untitled" : _sessionTitle;
+                EditorGUILayout.LabelField($"Current: {title}", EditorStyles.wordWrappedLabel);
+
+                if (_sessionIndex.Count > 0)
+                {
+                    var labels = BuildSessionLabels(_sessionIndex);
+                    var selection = _sessionSelectionIndex < 0 ? 0 : _sessionSelectionIndex;
+                    var nextSelection = EditorGUILayout.Popup("Switch", selection, labels);
+                    if (nextSelection != _sessionSelectionIndex && nextSelection >= 0 && nextSelection < _sessionIndex.Count)
+                    {
+                        SwitchSession(_sessionIndex[nextSelection].id);
+                    }
+                }
+
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    using (new EditorGUI.DisabledScope(!CanSwitchSessions()))
+                    {
+                        if (GUILayout.Button("New Session", GUILayout.Width(140f)))
+                        {
+                            StartNewSession();
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(!CanSwitchSessions() || !HasPreviousSession()))
+                    {
+                        if (GUILayout.Button("Continue Last", GUILayout.Width(140f)))
+                        {
+                            ContinueLastSession();
+                        }
+                    }
+
+                    GUILayout.FlexibleSpace();
+                }
+
+                if (!string.IsNullOrWhiteSpace(_sessionSummary))
+                {
+                    _showSessionSummary = EditorGUILayout.Foldout(_showSessionSummary, "Summary");
+                    if (_showSessionSummary)
+                    {
+                        using (new EditorGUI.DisabledScope(true))
+                        {
+                            EditorGUILayout.TextArea(_sessionSummary, GUILayout.MinHeight(60f));
+                        }
+                    }
+                }
+            }
+        }
+
+        private bool CanSwitchSessions()
+        {
+            return !_isSending && !_isAgentLoopActive && !_isCompactingSession && !IsOperationActive();
+        }
+
+        private bool HasPreviousSession()
+        {
+            if (_sessionIndex.Count == 0)
+            {
+                return false;
+            }
+
+            if (_sessionIndex.Count == 1)
+            {
+                return !string.Equals(_sessionIndex[0].id, _sessionId, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return true;
+        }
+
+        private static string[] BuildSessionLabels(List<ProtoChatSessionInfo> sessions)
+        {
+            if (sessions == null || sessions.Count == 0)
+            {
+                return Array.Empty<string>();
+            }
+
+            var labels = new string[sessions.Count];
+            for (var i = 0; i < sessions.Count; i++)
+            {
+                labels[i] = BuildSessionLabel(sessions[i]);
+            }
+
+            return labels;
+        }
+
+        private static string BuildSessionLabel(ProtoChatSessionInfo session)
+        {
+            if (session == null)
+            {
+                return "Unknown";
+            }
+
+            var title = string.IsNullOrWhiteSpace(session.title) ? "Untitled" : session.title.Trim();
+            var timeLabel = session.updatedAt > 0
+                ? DateTimeOffset.FromUnixTimeMilliseconds(session.updatedAt).ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                : "unknown";
+            return $"{title} ({timeLabel})";
+        }
+
         private void DrawContextOptions()
         {
             using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
@@ -158,7 +372,7 @@ namespace ProtoTipAI.Editor
                     if (GUILayout.Button("Refresh Summary", GUILayout.Width(140f)))
                     {
                         var summary = ProtoProjectContext.BuildProjectSummary();
-                        ProtoOpenAISettings.SetProjectSummary(summary);
+                        ProtoProjectSettings.SetProjectSummary(summary);
                         _status = "Project summary refreshed.";
                     }
 
@@ -169,9 +383,30 @@ namespace ProtoTipAI.Editor
                     }
                 }
 
-                if (string.IsNullOrWhiteSpace(ProtoOpenAISettings.GetProjectGoal()))
+                if (string.IsNullOrWhiteSpace(ProtoProjectSettings.GetProjectGoal()))
                 {
                     EditorGUILayout.HelpBox("Project Goal is empty. Set it in Setup for better context.", MessageType.Info);
+                }
+            }
+        }
+
+        private void DrawDiagnosticsPanel()
+        {
+            EnsureDiagnosticsRefreshed();
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+            {
+                EditorGUILayout.LabelField("Diagnostics", EditorStyles.boldLabel);
+                if (_diagnostics.Length == 0)
+                {
+                    EditorGUILayout.LabelField("No compilation errors or warnings detected recently.", EditorStyles.wordWrappedLabel);
+                }
+                else
+                {
+                    var count = Math.Min(_diagnostics.Length, 10);
+                    for (var i = 0; i < count; i++)
+                    {
+                        EditorGUILayout.LabelField(_diagnostics[i], EditorStyles.miniLabel);
+                    }
                 }
             }
         }
@@ -182,13 +417,19 @@ namespace ProtoTipAI.Editor
             {
                 EditorGUILayout.LabelField("Agent Tools", EditorStyles.boldLabel);
                 EditorGUILayout.LabelField("Plan Prompt");
-                _planPrompt = EditorGUILayout.TextArea(_planPrompt, GUILayout.MinHeight(50f));
+                var planPromptHeight = Mathf.Max(72f, EditorGUIUtility.singleLineHeight * 4f);
+                using (var scroll = new EditorGUILayout.ScrollViewScope(_planPromptScroll, GUILayout.Height(planPromptHeight)))
+                {
+                    _planPromptScroll = scroll.scrollPosition;
+                    _planPrompt = EditorGUILayout.TextArea(_planPrompt, MultiLineTextAreaStyle, GUILayout.ExpandHeight(true));
+                }
                 _overwriteScript = EditorGUILayout.ToggleLeft("Overwrite scripts if they exist", _overwriteScript);
                 _fixPassIterations = EditorGUILayout.IntSlider("Fix Step Iterations", _fixPassIterations, 1, 5);
+                _agentMaxIterations = EditorGUILayout.IntSlider("Agent Loop Iterations", _agentMaxIterations, 1, 50);
 
                 using (new EditorGUILayout.HorizontalScope())
                 {
-                    using (new EditorGUI.DisabledScope(_isGeneratingPlan || !ProtoOpenAISettings.HasToken()))
+                    using (new EditorGUI.DisabledScope(_isGeneratingPlan || !ProtoProviderSettings.HasApiKey()))
                     {
                         if (GUILayout.Button(_isGeneratingPlan ? "Planning..." : "Generate Plan", GUILayout.Width(140f)))
                         {
@@ -215,7 +456,7 @@ namespace ProtoTipAI.Editor
                         }
                     }
 
-                    using (new EditorGUI.DisabledScope(_isFixingErrors || !ProtoOpenAISettings.HasToken()))
+                using (new EditorGUI.DisabledScope(_isFixingErrors || !ProtoProviderSettings.HasApiKey()))
                     {
                         if (GUILayout.Button(_isFixingErrors ? "Fixing..." : "Fix Step", GUILayout.Width(120f)))
                         {
@@ -266,12 +507,720 @@ namespace ProtoTipAI.Editor
                     EditorGUILayout.HelpBox($"Waiting for OpenAI: {_apiWaitLabel} ({elapsed:0}s{timeoutLabel})", MessageType.Info);
                 }
 
+                if (_operationProgressTotal > 0)
+                {
+                    var progress = Mathf.Clamp01(_operationProgressTotal == 0
+                        ? 0f
+                        : (float)_operationProgressCurrent / _operationProgressTotal);
+                    var label = string.IsNullOrWhiteSpace(_operationProgressLabel)
+                        ? $"{_operationProgressCurrent}/{_operationProgressTotal}"
+                        : $"{_operationProgressLabel} ({_operationProgressCurrent}/{_operationProgressTotal})";
+                    var rect = GUILayoutUtility.GetRect(18f, 18f);
+                    EditorGUI.ProgressBar(rect, progress, label);
+                }
+
                 if (!string.IsNullOrWhiteSpace(_toolStatus))
                 {
                     EditorGUILayout.HelpBox(_toolStatus, MessageType.Info);
                 }
             }
         }
+
+        private void DrawToolPanel()
+        {
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+            {
+                EditorGUILayout.LabelField("Tool Bench", EditorStyles.boldLabel);
+                _selectedToolType = (ProtoToolType)EditorGUILayout.Popup("Tool", (int)_selectedToolType, ToolLabels);
+                _toolFilePath = EditorGUILayout.TextField("Path", _toolFilePath);
+
+                switch (_selectedToolType)
+                {
+                    case ProtoToolType.ReadFile:
+                        EditorGUILayout.LabelField("Reads a file and shows a preview.", EditorStyles.wordWrappedLabel);
+                        break;
+                    case ProtoToolType.WriteFile:
+                        EditorGUILayout.LabelField("Replaces the file content with your text.", EditorStyles.wordWrappedLabel);
+                        _toolContent = EditorGUILayout.TextArea(_toolContent, GUILayout.MinHeight(80f));
+                        break;
+                    case ProtoToolType.ListDirectory:
+                        EditorGUILayout.LabelField("Lists the first entries inside a folder.", EditorStyles.wordWrappedLabel);
+                        break;
+                    case ProtoToolType.SearchText:
+                        EditorGUILayout.LabelField("Search for text across the project.", EditorStyles.wordWrappedLabel);
+                        _toolSearchTerm = EditorGUILayout.TextField("Search Text", _toolSearchTerm);
+                        break;
+                }
+
+                if (!string.IsNullOrWhiteSpace(_toolExecutionStatus))
+                {
+                    EditorGUILayout.HelpBox(_toolExecutionStatus, MessageType.Info);
+                }
+
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.FlexibleSpace();
+                    using (new EditorGUI.DisabledScope(_toolIsRunning))
+                    {
+                        if (GUILayout.Button("Run Tool", GUILayout.Width(120f)))
+                        {
+                            _ = RunToolAsync();
+                        }
+                    }
+                }
+            }
+        }
+
+        private async Task RunToolAsync()
+        {
+            if (_toolIsRunning)
+            {
+                return;
+            }
+
+            var trimmedPath = _toolFilePath.Trim();
+            if (string.IsNullOrWhiteSpace(trimmedPath))
+            {
+                _toolExecutionStatus = "Provide a path first.";
+                return;
+            }
+
+            _toolIsRunning = true;
+            _toolExecutionStatus = "Running tool...";
+            var absolutePath = ResolveAbsolutePath(trimmedPath);
+            var relativePath = BuildRelativePath(absolutePath);
+            try
+            {
+                switch (_selectedToolType)
+                {
+                    case ProtoToolType.ReadFile:
+                        await RunReadFileAsync(absolutePath, relativePath).ConfigureAwait(false);
+                        break;
+                    case ProtoToolType.WriteFile:
+                        await RunWriteFileAsync(absolutePath, relativePath).ConfigureAwait(false);
+                        break;
+                    case ProtoToolType.ListDirectory:
+                        await RunListDirectoryAsync(absolutePath, relativePath).ConfigureAwait(false);
+                        break;
+                    case ProtoToolType.SearchText:
+                        await RunSearchTextAsync(absolutePath, relativePath).ConfigureAwait(false);
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                _toolExecutionStatus = $"Tool failed: {ex.Message}";
+            }
+            finally
+            {
+                _toolIsRunning = false;
+                Repaint();
+            }
+        }
+
+        private async Task RunReadFileAsync(string absolutePath, string relativePath)
+        {
+            if (!File.Exists(absolutePath))
+            {
+                _toolExecutionStatus = $"File not found: {relativePath}.";
+                return;
+            }
+
+            string content;
+            try
+            {
+                content = File.ReadAllText(absolutePath);
+            }
+            catch (Exception ex)
+            {
+                _toolExecutionStatus = $"Unable to read file: {ex.Message}";
+                return;
+            }
+
+            var preview = content.Length > 4000 ? $"{content.Substring(0, 4000)}\n... (truncated)" : content;
+            AppendToolMessage("Read File", relativePath, preview);
+            _toolExecutionStatus = $"Read {relativePath} ({content.Length} chars).";
+        }
+
+        private async Task RunWriteFileAsync(string absolutePath, string relativePath)
+        {
+            if (!ProtoToolSettings.GetAutoConfirm())
+            {
+                if (!EditorUtility.DisplayDialog(
+                    "Confirm Write",
+                    $"Overwrite {relativePath}?",
+                    "Overwrite",
+                    "Cancel"))
+                {
+                    _toolExecutionStatus = "Write canceled.";
+                    return;
+                }
+            }
+
+            await RunOnMainThread(() =>
+            {
+                var directory = Path.GetDirectoryName(absolutePath);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                File.WriteAllText(absolutePath, _toolContent ?? string.Empty);
+                AssetDatabase.Refresh();
+            }).ConfigureAwait(false);
+
+            AppendToolMessage("Write File", relativePath, _toolContent ?? string.Empty);
+            _toolExecutionStatus = $"Wrote {relativePath}.";
+        }
+
+        private Task RunListDirectoryAsync(string absolutePath, string relativePath)
+        {
+            if (!Directory.Exists(absolutePath))
+            {
+                _toolExecutionStatus = $"Folder not found: {relativePath}.";
+                return Task.CompletedTask;
+            }
+
+            var entries = Directory.GetFileSystemEntries(absolutePath);
+            var previewList = new List<string>(Math.Min(entries.Length, 20));
+            for (var i = 0; i < entries.Length && previewList.Count < 20; i++)
+            {
+                previewList.Add(BuildRelativePath(entries[i]));
+            }
+
+            var body = previewList.Count == 0 ? "(empty)" : string.Join("\n", previewList);
+            AppendToolMessage("List Folder", relativePath, body);
+            _toolExecutionStatus = $"Found {entries.Length} entries.";
+            return Task.CompletedTask;
+        }
+
+        private async Task RunSearchTextAsync(string absolutePath, string relativePath)
+        {
+            var term = _toolSearchTerm.Trim();
+            if (string.IsNullOrWhiteSpace(term))
+            {
+                _toolExecutionStatus = "Enter text to search for.";
+                return;
+            }
+
+            var searchRoot = Directory.Exists(absolutePath) ? absolutePath : GetProjectRoot();
+            var matches = new List<string>();
+            await Task.Run(() =>
+            {
+                foreach (var file in Directory.EnumerateFiles(searchRoot, "*.*", SearchOption.AllDirectories))
+                {
+                    if (file.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string content;
+                    try
+                    {
+                        content = File.ReadAllText(file);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (content.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        matches.Add(BuildRelativePath(file));
+                        if (matches.Count >= 12)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }).ConfigureAwait(false);
+
+            if (matches.Count == 0)
+            {
+                _toolExecutionStatus = $"No matches for \"{term}\".";
+                return;
+            }
+
+            AppendToolMessage("Search Text", relativePath, string.Join("\n", matches));
+            _toolExecutionStatus = $"Found {matches.Count} matches for \"{term}\".";
+        }
+
+        private void AppendToolMessage(string title, string relativePath, string content)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine($"[{title}] {relativePath}");
+            builder.AppendLine(content);
+            AddChatMessage(new ProtoChatMessage
+            {
+                role = RoleAssistant,
+                content = builder.ToString().Trim()
+            });
+        }
+
+        private void AddChatMessage(ProtoChatMessage message)
+        {
+            if (message == null)
+            {
+                return;
+            }
+
+            _messages.Add(message);
+            MarkChatHistoryDirty();
+        }
+
+        private void UpdateChatMessageContent(int index, string content)
+        {
+            if (index < 0 || index >= _messages.Count)
+            {
+                return;
+            }
+
+            if (_messages[index] == null)
+            {
+                return;
+            }
+
+            _messages[index].content = content;
+            MarkChatHistoryDirty();
+        }
+
+        private void ClearChatHistory()
+        {
+            StartNewSession();
+        }
+
+        private void MarkChatHistoryDirty()
+        {
+            _chatHistoryDirty = true;
+            if (_chatHistorySaveQueued)
+            {
+                return;
+            }
+
+            _chatHistorySaveQueued = true;
+            EditorApplication.delayCall += SaveChatHistoryIfDirty;
+        }
+
+        private void SaveChatHistoryIfDirty()
+        {
+            if (!_chatHistoryDirty)
+            {
+                _chatHistorySaveQueued = false;
+                return;
+            }
+
+            _chatHistorySaveQueued = false;
+            _chatHistoryDirty = false;
+            SaveChatHistoryToDisk();
+        }
+
+        private void SaveChatHistoryToDisk()
+        {
+            EnsureSessionId();
+            var now = ProtoChatSessionStore.NowMillis();
+            if (_sessionCreatedAt <= 0)
+            {
+                _sessionCreatedAt = now;
+            }
+
+            _sessionUpdatedAt = now;
+            if (IsDefaultSessionTitle(_sessionTitle))
+            {
+                var derived = DeriveSessionTitle(_messages);
+                if (!string.IsNullOrWhiteSpace(derived))
+                {
+                    _sessionTitle = derived;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(_sessionTitle))
+            {
+                _sessionTitle = BuildDefaultSessionTitle(now);
+            }
+
+            var messages = TrimMessagesForStorage(_messages);
+            var session = new ProtoChatSession
+            {
+                id = _sessionId,
+                title = _sessionTitle,
+                createdAt = _sessionCreatedAt,
+                updatedAt = _sessionUpdatedAt,
+                summary = _sessionSummary ?? string.Empty,
+                messages = messages,
+                lastAgentGoal = _lastAgentGoal ?? string.Empty,
+                agentHistory = _agentHistory.Count == 0 ? Array.Empty<string>() : _agentHistory.ToArray()
+            };
+
+            ProtoChatSessionStore.SaveSession(session);
+            UpsertSessionIndex(session);
+            ProtoChatSessionStore.SaveSessionIndex(_sessionIndex);
+            _sessionSelectionIndex = FindSessionIndex(_sessionId);
+            EditorPrefs.SetString(SessionPrefsKey, _sessionId);
+        }
+
+        private void RestoreChatHistoryFromDisk()
+        {
+            _sessionIndex.Clear();
+            _sessionIndex.AddRange(ProtoChatSessionStore.LoadSessionIndex());
+
+            if (ProtoChatSessionStore.TryMigrateLegacyHistory(out var migrated))
+            {
+                UpsertSessionIndex(migrated);
+                ProtoChatSessionStore.SaveSessionIndex(_sessionIndex);
+                SetActiveSession(migrated);
+                return;
+            }
+
+            var lastSessionId = EditorPrefs.GetString(SessionPrefsKey, string.Empty);
+            ProtoChatSession session = null;
+            if (!string.IsNullOrWhiteSpace(lastSessionId))
+            {
+                session = ProtoChatSessionStore.LoadSession(lastSessionId);
+            }
+
+            if (session == null && _sessionIndex.Count > 0)
+            {
+                session = ProtoChatSessionStore.LoadSession(_sessionIndex[0].id);
+            }
+
+            if (session == null)
+            {
+                session = CreateNewSessionSnapshot();
+                ProtoChatSessionStore.SaveSession(session);
+                UpsertSessionIndex(session);
+                ProtoChatSessionStore.SaveSessionIndex(_sessionIndex);
+            }
+
+            SetActiveSession(session);
+        }
+
+        private void StartNewSession()
+        {
+            if (!CanSwitchSessions())
+            {
+                return;
+            }
+
+            SaveChatHistoryIfDirty();
+            var session = CreateNewSessionSnapshot();
+            ProtoChatSessionStore.SaveSession(session);
+            UpsertSessionIndex(session);
+            ProtoChatSessionStore.SaveSessionIndex(_sessionIndex);
+            SetActiveSession(session);
+        }
+
+        private void ContinueLastSession()
+        {
+            if (_sessionIndex.Count == 0)
+            {
+                return;
+            }
+
+            var target = _sessionIndex[0];
+            if (string.Equals(target.id, _sessionId, StringComparison.OrdinalIgnoreCase) && _sessionIndex.Count > 1)
+            {
+                target = _sessionIndex[1];
+            }
+
+            if (string.Equals(target.id, _sessionId, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            SwitchSession(target.id);
+        }
+
+        private void SwitchSession(string sessionId)
+        {
+            if (!CanSwitchSessions() || string.IsNullOrWhiteSpace(sessionId))
+            {
+                return;
+            }
+
+            SaveChatHistoryIfDirty();
+            var session = ProtoChatSessionStore.LoadSession(sessionId);
+            if (session == null)
+            {
+                return;
+            }
+
+            SetActiveSession(session);
+        }
+
+        private void SetActiveSession(ProtoChatSession session)
+        {
+            if (session == null)
+            {
+                return;
+            }
+
+            if (FindSessionIndex(session.id) < 0)
+            {
+                UpsertSessionIndex(session);
+                ProtoChatSessionStore.SaveSessionIndex(_sessionIndex);
+            }
+
+            _messages.Clear();
+            if (session.messages != null)
+            {
+                _messages.AddRange(session.messages);
+            }
+
+            _agentHistory.Clear();
+            if (session.agentHistory != null)
+            {
+                _agentHistory.AddRange(session.agentHistory);
+            }
+
+            _lastAgentGoal = session.lastAgentGoal ?? string.Empty;
+            _sessionSummary = session.summary ?? string.Empty;
+            _sessionId = session.id ?? string.Empty;
+            _sessionTitle = session.title ?? string.Empty;
+            _sessionCreatedAt = session.createdAt;
+            _sessionUpdatedAt = session.updatedAt;
+            _sessionSelectionIndex = FindSessionIndex(_sessionId);
+            _agentReadMemory.Clear();
+            _agentToolCallHistory.Clear();
+            _status = string.Empty;
+            _toolStatus = string.Empty;
+            EditorPrefs.SetString(SessionPrefsKey, _sessionId);
+            Repaint();
+        }
+
+        private void EnsureSessionId()
+        {
+            if (!string.IsNullOrWhiteSpace(_sessionId))
+            {
+                return;
+            }
+
+            var session = CreateNewSessionSnapshot();
+            _sessionId = session.id;
+            _sessionTitle = session.title;
+            _sessionCreatedAt = session.createdAt;
+            _sessionUpdatedAt = session.updatedAt;
+            _sessionSummary = session.summary ?? string.Empty;
+            UpsertSessionIndex(session);
+            ProtoChatSessionStore.SaveSessionIndex(_sessionIndex);
+        }
+
+        private ProtoChatSession CreateNewSessionSnapshot()
+        {
+            var now = ProtoChatSessionStore.NowMillis();
+            return new ProtoChatSession
+            {
+                id = Guid.NewGuid().ToString("N"),
+                title = BuildDefaultSessionTitle(now),
+                createdAt = now,
+                updatedAt = now,
+                summary = string.Empty,
+                messages = Array.Empty<ProtoChatMessage>(),
+                lastAgentGoal = string.Empty,
+                agentHistory = Array.Empty<string>()
+            };
+        }
+
+        private void UpsertSessionIndex(ProtoChatSession session)
+        {
+            if (session == null || string.IsNullOrWhiteSpace(session.id))
+            {
+                return;
+            }
+
+            var info = new ProtoChatSessionInfo
+            {
+                id = session.id,
+                title = session.title,
+                createdAt = session.createdAt,
+                updatedAt = session.updatedAt
+            };
+
+            var index = FindSessionIndex(session.id);
+            if (index >= 0)
+            {
+                _sessionIndex[index] = info;
+            }
+            else
+            {
+                _sessionIndex.Add(info);
+            }
+
+            _sessionIndex.Sort((a, b) => b.updatedAt.CompareTo(a.updatedAt));
+        }
+
+        private int FindSessionIndex(string sessionId)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId))
+            {
+                return -1;
+            }
+
+            for (var i = 0; i < _sessionIndex.Count; i++)
+            {
+                var entry = _sessionIndex[i];
+                if (entry != null && string.Equals(entry.id, sessionId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private static ProtoChatMessage[] TrimMessagesForStorage(List<ProtoChatMessage> messages)
+        {
+            if (messages == null || messages.Count == 0)
+            {
+                return Array.Empty<ProtoChatMessage>();
+            }
+
+            var count = messages.Count;
+            var startIndex = count > MaxChatHistoryMessages ? count - MaxChatHistoryMessages : 0;
+            var messageCount = count - startIndex;
+            var trimmed = new ProtoChatMessage[messageCount];
+            for (var i = 0; i < messageCount; i++)
+            {
+                trimmed[i] = messages[startIndex + i];
+            }
+
+            return trimmed;
+        }
+
+        private static string DeriveSessionTitle(List<ProtoChatMessage> messages)
+        {
+            if (messages == null)
+            {
+                return string.Empty;
+            }
+
+            foreach (var message in messages)
+            {
+                if (message == null || string.IsNullOrWhiteSpace(message.content))
+                {
+                    continue;
+                }
+
+                if (!string.Equals(message.role, RoleUser, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var title = message.content.Trim();
+                if (title.Length > 60)
+                {
+                    title = title.Substring(0, 57) + "...";
+                }
+
+                return title;
+            }
+
+            return string.Empty;
+        }
+
+        private static string BuildDefaultSessionTitle(long timestampMillis)
+        {
+            if (timestampMillis <= 0)
+            {
+                timestampMillis = ProtoChatSessionStore.NowMillis();
+            }
+
+            var date = DateTimeOffset.FromUnixTimeMilliseconds(timestampMillis).ToLocalTime();
+            return $"New session - {date:yyyy-MM-dd HH:mm}";
+        }
+
+        private static bool IsDefaultSessionTitle(string title)
+        {
+            if (string.IsNullOrWhiteSpace(title))
+            {
+                return true;
+            }
+
+            return title.StartsWith("New session - ", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ResolveAbsolutePath(string relativePath)
+        {
+            if (string.IsNullOrWhiteSpace(relativePath))
+            {
+                return string.Empty;
+            }
+
+            var normalized = relativePath.Replace('\\', '/');
+            if (Path.IsPathRooted(normalized))
+            {
+                return Path.GetFullPath(normalized);
+            }
+
+            var root = GetProjectRoot();
+            return Path.GetFullPath(Path.Combine(root, normalized));
+        }
+
+        private static string BuildRelativePath(string absolutePath)
+        {
+            if (string.IsNullOrWhiteSpace(absolutePath))
+            {
+                return string.Empty;
+            }
+
+            var normalized = absolutePath.Replace('\\', '/');
+            var projectRoot = GetProjectRoot().Replace('\\', '/');
+            if (!string.IsNullOrWhiteSpace(projectRoot) && normalized.StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                var relative = normalized.Substring(projectRoot.Length).TrimStart('/');
+                if (string.IsNullOrWhiteSpace(relative))
+                {
+                    return "Assets";
+                }
+
+                if (relative.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(relative, "Assets", StringComparison.OrdinalIgnoreCase))
+                {
+                    return relative;
+                }
+
+                return relative;
+            }
+
+            return normalized;
+        }
+
+        private static string GetProjectRoot()
+        {
+            return Directory.GetParent(Application.dataPath)?.FullName ?? Directory.GetCurrentDirectory();
+        }
+
+        private void EnsureDiagnosticsRefreshed()
+        {
+            var now = EditorApplication.timeSinceStartup;
+            if (now - _lastDiagnosticsRefresh < 3.0)
+            {
+                return;
+            }
+
+            _diagnostics = CollectDiagnostics();
+            _lastDiagnosticsRefresh = now;
+        }
+
+        private static string[] CollectDiagnostics()
+        {
+            var errors = GetConsoleErrorItems();
+            if (errors.Count == 0)
+            {
+                return Array.Empty<string>();
+            }
+
+            var results = new List<string>(Math.Min(errors.Count, 12));
+            for (var i = 0; i < errors.Count && results.Count < 12; i++)
+            {
+                var error = errors[i];
+                var path = string.IsNullOrWhiteSpace(error.filePath) ? "(console)" : error.filePath;
+                var lineInfo = error.line >= 0 ? $":{error.line}" : string.Empty;
+                results.Add($"{error.type}: {path}{lineInfo} {error.message}");
+            }
+
+            return results.ToArray();
+        }
+
 
         private void DrawStageButtons()
         {
@@ -301,11 +1250,11 @@ namespace ProtoTipAI.Editor
                     {
                         if (GUILayout.Button("Create Prefabs", GUILayout.Width(140f)))
                         {
-                            _ = ApplyPlanStageAsync("prefabs", new[] { "prefab" });
+                            _ = ApplyPlanStageAsync("prefabs", new[] { "prefab", "prefab_component" });
                         }
                         if (GUILayout.Button("Create Scenes", GUILayout.Width(140f)))
                         {
-                            _ = ApplyPlanStageAsync("scenes", new[] { "scene" });
+                            _ = ApplyPlanStageAsync("scenes", new[] { "scene", "scene_prefab", "scene_manager" });
                         }
                         if (GUILayout.Button("Create Assets", GUILayout.Width(140f)))
                         {
@@ -316,27 +1265,110 @@ namespace ProtoTipAI.Editor
             }
         }
 
+        private string GetSelectedPhaseId()
+        {
+            if (_cachedPhasePlan?.phases == null || _cachedPhasePlan.phases.Length == 0)
+            {
+                return null;
+            }
+
+            if (_selectedPhaseIndex <= 0)
+            {
+                return null;
+            }
+
+            var index = _selectedPhaseIndex - 1;
+            if (index < 0 || index >= _cachedPhasePlan.phases.Length)
+            {
+                return null;
+            }
+
+            return _cachedPhasePlan.phases[index]?.id;
+        }
+
+        private string GetSelectedPhaseLabel()
+        {
+            if (_phaseLabels == null || _phaseLabels.Length <= 1)
+            {
+                return null;
+            }
+
+            if (_selectedPhaseIndex <= 0 || _selectedPhaseIndex >= _phaseLabels.Length)
+            {
+                return null;
+            }
+
+            return _phaseLabels[_selectedPhaseIndex];
+        }
+
+        private static List<ProtoFeatureRequest> FilterRequestsByPhase(List<ProtoFeatureRequest> requests, string phaseId)
+        {
+            if (requests == null)
+            {
+                return new List<ProtoFeatureRequest>();
+            }
+
+            if (string.IsNullOrWhiteSpace(phaseId))
+            {
+                return new List<ProtoFeatureRequest>(requests);
+            }
+
+            var filtered = new List<ProtoFeatureRequest>();
+            foreach (var request in requests)
+            {
+                if (request == null)
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(request.phaseId) || string.Equals(request.phaseId, phaseId, StringComparison.OrdinalIgnoreCase))
+                {
+                    filtered.Add(request);
+                }
+            }
+
+            return filtered;
+        }
+
         private void DrawInputArea()
         {
             using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
             {
                 EditorGUILayout.LabelField("Message", EditorStyles.boldLabel);
-                _input = EditorGUILayout.TextArea(_input, GUILayout.MinHeight(60f));
+                var inputHeight = Mathf.Max(92f, EditorGUIUtility.singleLineHeight * 5f);
+                using (var scroll = new EditorGUILayout.ScrollViewScope(_inputScroll, GUILayout.Height(inputHeight)))
+                {
+                    _inputScroll = scroll.scrollPosition;
+                    _input = EditorGUILayout.TextArea(_input, MultiLineTextAreaStyle, GUILayout.ExpandHeight(true));
+                }
 
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     GUILayout.FlexibleSpace();
-                    using (new EditorGUI.DisabledScope(_isSending || !ProtoOpenAISettings.HasToken() || string.IsNullOrWhiteSpace(_input)))
+                    using (new EditorGUI.DisabledScope(_isSending || _isAgentLoopActive))
                     {
-                        if (GUILayout.Button(_isSending ? "Sending..." : "Send", GUILayout.Width(120f)))
+                        if (GUILayout.Button("Command", GUILayout.Width(120f)))
+                        {
+                            OpenCommandDialog();
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(_isAgentLoopActive || _isSending || !ProtoProviderSettings.HasApiKey() || string.IsNullOrWhiteSpace(_input)))
+                    {
+                        if (GUILayout.Button(_isAgentLoopActive ? "Agent..." : "Agent", GUILayout.Width(120f)))
                         {
                             var text = _input.Trim();
                             _input = string.Empty;
-                            _ = SendAsync(text);
+                            _ = RunAgentLoopAsync(text);
                         }
                     }
                 }
             }
+        }
+
+        private void OpenCommandDialog()
+        {
+            ProtoAgentCommandWindow.Show(this);
         }
 
         private async Task SendAsync(string userText)
@@ -357,29 +1389,30 @@ namespace ProtoTipAI.Editor
             _cancelRequested = false;
             var token = BeginOperation("chat");
             _apiWaitTimeoutSeconds = 320;
-            _messages.Add(new ProtoChatMessage { role = RoleUser, content = userText });
+            AddChatMessage(new ProtoChatMessage { role = RoleUser, content = userText });
+            await MaybeCompactSessionAsync(token).ConfigureAwait(false);
             var requestMessages = _messages.ToArray();
             var assistantIndex = _messages.Count;
-            _messages.Add(new ProtoChatMessage { role = RoleAssistant, content = "..." });
+            AddChatMessage(new ProtoChatMessage { role = RoleAssistant, content = "..." });
             Repaint();
 
             try
             {
                 var settings = await RunOnMainThread(GetSettingsSnapshot).ConfigureAwait(false);
                 await RunOnMainThread(() => BeginApiWait("chat response")).ConfigureAwait(false);
-                var response = await ProtoOpenAIClient.SendChatAsync(settings.token, settings.model, BuildRequestMessages(requestMessages), _apiWaitTimeoutSeconds, token).ConfigureAwait(false);
+                var response = await ProtoProviderClient.SendChatAsync(settings, BuildRequestMessages(requestMessages), _apiWaitTimeoutSeconds, token).ConfigureAwait(false);
 
-                _messages[assistantIndex].content = response;
+                UpdateChatMessageContent(assistantIndex, response);
                 _status = string.Empty;
             }
             catch (OperationCanceledException)
             {
-                _messages[assistantIndex].content = "Canceled.";
+                UpdateChatMessageContent(assistantIndex, "Canceled.");
                 _status = "Canceled.";
             }
             catch (Exception ex)
             {
-                _messages[assistantIndex].content = "Error getting response.";
+                UpdateChatMessageContent(assistantIndex, "Error getting response.");
                 _status = ex.Message;
             }
             finally
@@ -391,6 +1424,1229 @@ namespace ProtoTipAI.Editor
             }
         }
 
+        private async Task RunAgentLoopAsync(string userGoal)
+        {
+            if (string.IsNullOrWhiteSpace(userGoal) || _isAgentLoopActive)
+            {
+                return;
+            }
+
+            var trimmedGoal = userGoal.Trim();
+            var isContinuation = IsContinuationPrompt(trimmedGoal);
+            var effectiveGoal = trimmedGoal;
+            if (isContinuation && !string.IsNullOrWhiteSpace(_lastAgentGoal))
+            {
+                effectiveGoal = _lastAgentGoal;
+            }
+            else
+            {
+                _lastAgentGoal = trimmedGoal;
+                _agentHistory.Clear();
+                _agentReadMemory.Clear();
+                _agentToolCallHistory.Clear();
+            }
+
+            _isAgentLoopActive = true;
+            _status = "Agent loop running...";
+            _cancelRequested = false;
+            var token = BeginOperation("agent loop");
+            _apiWaitTimeoutSeconds = 320;
+            var displayGoal = isContinuation && !string.Equals(trimmedGoal, effectiveGoal, StringComparison.OrdinalIgnoreCase)
+                ? $"Continue: {effectiveGoal}"
+                : trimmedGoal;
+            AddChatMessage(new ProtoChatMessage { role = RoleUser, content = displayGoal });
+            await MaybeCompactSessionAsync(token).ConfigureAwait(false);
+            Repaint();
+
+            var toolHistory = _agentHistory;
+            var completed = false;
+
+            try
+            {
+                for (var iteration = 0; iteration < _agentMaxIterations; iteration++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    await RunOnMainThread(() =>
+                    {
+                        _toolStatus = $"Agent iteration {iteration + 1}/{_agentMaxIterations}...";
+                        Repaint();
+                    }).ConfigureAwait(false);
+
+                    var action = await RequestAgentActionAsync(effectiveGoal, iteration + 1, _agentMaxIterations, toolHistory, token).ConfigureAwait(false);
+                    if (action == null || string.IsNullOrWhiteSpace(action.action))
+                    {
+                        await AppendAgentMessageAsync("Agent response was invalid. Stopping.").ConfigureAwait(false);
+                        completed = true;
+                        break;
+                    }
+
+                    var result = await ExecuteAgentActionAsync(action, token).ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(result.historyEntry))
+                    {
+                        AppendAgentHistory(toolHistory, result.historyEntry);
+                        MarkChatHistoryDirty();
+                    }
+
+                    if (result.stop)
+                    {
+                        completed = true;
+                        break;
+                    }
+                }
+
+                if (!completed)
+                {
+                    await AppendAgentMessageAsync("Agent loop reached the max iteration limit. Type 'continue' to resume.").ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                await AppendAgentMessageAsync("Agent loop canceled.").ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                await AppendAgentMessageAsync($"Agent loop error: {ex.Message}").ConfigureAwait(false);
+            }
+            finally
+            {
+                await RunOnMainThread(() =>
+                {
+                    _isAgentLoopActive = false;
+                    _status = string.Empty;
+                    EndApiWait();
+                    EndOperation();
+                    Repaint();
+                }).ConfigureAwait(false);
+            }
+        }
+
+        private async Task<ProtoAgentAction> RequestAgentActionAsync(
+            string userGoal,
+            int iteration,
+            int maxIterations,
+            List<string> toolHistory,
+            CancellationToken token)
+        {
+            var baseMessages = await RunOnMainThread(() => BuildBaseContextMessages(true).ToArray()).ConfigureAwait(false);
+            var messages = new List<ProtoChatMessage>(baseMessages ?? Array.Empty<ProtoChatMessage>());
+            messages.Add(new ProtoChatMessage
+            {
+                role = "system",
+                content = ProtoPrompts.AgentLoopSystemInstruction
+            });
+            messages.Add(new ProtoChatMessage
+            {
+                role = "system",
+                content = ProtoPrompts.AgentLoopToolSchema
+            });
+            messages.Add(new ProtoChatMessage
+            {
+                role = "user",
+                content = string.Format(ProtoPrompts.AgentLoopGoalFormat, userGoal)
+            });
+            messages.Add(new ProtoChatMessage
+            {
+                role = "user",
+                content = string.Format(ProtoPrompts.AgentLoopIterationFormat, iteration, maxIterations)
+            });
+
+            var recentChat = BuildRecentChatContext(_messages, 6);
+            if (!string.IsNullOrWhiteSpace(recentChat))
+            {
+                messages.Add(new ProtoChatMessage
+                {
+                    role = "user",
+                    content = string.Format(ProtoPrompts.AgentLoopChatHistoryFormat, recentChat)
+                });
+            }
+
+            if (toolHistory != null && toolHistory.Count > 0)
+            {
+                var historyText = string.Join("\n\n", toolHistory);
+                messages.Add(new ProtoChatMessage
+                {
+                    role = "user",
+                    content = string.Format(ProtoPrompts.AgentLoopHistoryFormat, historyText)
+                });
+            }
+
+            var diagnostics = await RunOnMainThread(CollectDiagnostics).ConfigureAwait(false);
+            if (diagnostics != null && diagnostics.Length > 0)
+            {
+                messages.Add(new ProtoChatMessage
+                {
+                    role = "user",
+                    content = string.Format(ProtoPrompts.AgentLoopDiagnosticsFormat, string.Join("\n", diagnostics))
+                });
+            }
+
+            var settings = await RunOnMainThread(GetSettingsSnapshot).ConfigureAwait(false);
+            if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
+            {
+                return new ProtoAgentAction
+                {
+                    action = "respond",
+                    message = "Missing API key."
+                };
+            }
+
+            await RunOnMainThread(() => BeginApiWait($"agent {iteration}/{maxIterations}")).ConfigureAwait(false);
+            var response = await ProtoProviderClient.SendChatAsync(
+                settings,
+                messages.ToArray(),
+                _apiWaitTimeoutSeconds,
+                token).ConfigureAwait(false);
+            await RunOnMainThread(EndApiWait).ConfigureAwait(false);
+
+            if (TryParseAgentAction(response, out var action))
+            {
+                return action;
+            }
+
+            var retryMessages = new List<ProtoChatMessage>(messages)
+            {
+                new ProtoChatMessage
+                {
+                    role = "system",
+                    content = ProtoPrompts.AgentLoopRetryInstruction
+                },
+                new ProtoChatMessage
+                {
+                    role = "user",
+                    content = string.Format(ProtoPrompts.AgentLoopRetryResponseFormat, ClampToolOutput(response, AgentMaxToolOutputChars))
+                }
+            };
+
+            await RunOnMainThread(() => BeginApiWait($"agent retry {iteration}/{maxIterations}")).ConfigureAwait(false);
+            var retryResponse = await ProtoProviderClient.SendChatAsync(
+                settings,
+                retryMessages.ToArray(),
+                _apiWaitTimeoutSeconds,
+                token).ConfigureAwait(false);
+            await RunOnMainThread(EndApiWait).ConfigureAwait(false);
+
+            if (TryParseAgentAction(retryResponse, out var retryAction))
+            {
+                return retryAction;
+            }
+
+            await AppendAgentMessageAsync($"Agent response invalid. Raw response:\n{ClampToolOutput(retryResponse, AgentMaxToolOutputChars)}")
+                .ConfigureAwait(false);
+            return null;
+        }
+
+        private async Task<AgentActionResult> ExecuteAgentActionAsync(ProtoAgentAction action, CancellationToken token)
+        {
+            var actionName = NormalizeAgentActionName(action.action);
+            switch (actionName)
+            {
+                case "read_file":
+                    return new AgentActionResult
+                    {
+                        historyEntry = await AgentReadFileAsync(action, token).ConfigureAwait(false)
+                    };
+                case "write_file":
+                    return new AgentActionResult
+                    {
+                        historyEntry = await AgentWriteFileAsync(action.path, action.content, token).ConfigureAwait(false)
+                    };
+                case "list_folder":
+                    return new AgentActionResult
+                    {
+                        historyEntry = await AgentListFolderAsync(action.path, token).ConfigureAwait(false)
+                    };
+                case "search_text":
+                    return new AgentActionResult
+                    {
+                        historyEntry = await AgentSearchTextAsync(action.path, action.query, token).ConfigureAwait(false)
+                    };
+                case "apply_plan":
+                    await ApplyPlanInternalAsync(token, false).ConfigureAwait(false);
+                    return new AgentActionResult
+                    {
+                        historyEntry = BuildAgentStatusHistory("Apply Plan", _toolStatus)
+                    };
+                case "apply_stage":
+                    if (!TryResolveAgentStage(action.stage, out var label, out var types))
+                    {
+                        return new AgentActionResult
+                        {
+                            historyEntry = BuildAgentErrorHistory("Apply Stage", $"Unknown stage \"{action.stage}\".")
+                        };
+                    }
+                    await ApplyPlanStageInternalAsync(label, types, token, false).ConfigureAwait(false);
+                    return new AgentActionResult
+                    {
+                        historyEntry = BuildAgentStatusHistory($"Apply Stage ({label})", _toolStatus)
+                    };
+                case "fix_pass":
+                    var scope = NormalizeAgentToken(action.scope);
+                    HashSet<string> targets = null;
+                    var passLabel = string.Empty;
+                    if (string.Equals(scope, "last_stage", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(scope, "last", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(scope, "previous_stage", StringComparison.OrdinalIgnoreCase))
+                    {
+                        targets = _lastFixPassTargets;
+                        passLabel = "last stage";
+                    }
+                    else if (string.Equals(scope, "all", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(scope, "all_scripts", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(scope, "all_errors", StringComparison.OrdinalIgnoreCase))
+                    {
+                        targets = new HashSet<string>();
+                        passLabel = "all scripts";
+                    }
+                    else if (!string.IsNullOrWhiteSpace(scope))
+                    {
+                        return new AgentActionResult
+                        {
+                            historyEntry = BuildAgentErrorHistory("Fix Pass", $"Unknown scope \"{action.scope}\".")
+                        };
+                    }
+                    await RunFixPassInternalAsync(targets, passLabel, token, false).ConfigureAwait(false);
+                    return new AgentActionResult
+                    {
+                        historyEntry = BuildAgentStatusHistory("Fix Pass", _toolStatus)
+                    };
+                case "respond":
+                    if (AgentResponseRequestsUserInput(action.message))
+                    {
+                        await AppendAgentMessageAsync("Agent needs more context. Retrying with tools.").ConfigureAwait(false);
+                        return new AgentActionResult
+                        {
+                            historyEntry = "[Guard] Response requested user input. Use tools to fetch context instead."
+                        };
+                    }
+                    await AppendAgentMessageAsync(string.IsNullOrWhiteSpace(action.message)
+                        ? "Done."
+                        : action.message.Trim()).ConfigureAwait(false);
+                    return new AgentActionResult { stop = true };
+                case "stop":
+                    await AppendAgentMessageAsync("Agent stopped.").ConfigureAwait(false);
+                    return new AgentActionResult { stop = true };
+                default:
+                    await AppendAgentMessageAsync($"Agent returned unknown action: {action.action}.").ConfigureAwait(false);
+                    return new AgentActionResult { stop = true };
+            }
+        }
+
+        private async Task<string> AgentReadFileAsync(ProtoAgentAction action, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            var path = action?.path;
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return BuildAgentErrorHistory("Read File", "Missing path.");
+            }
+
+            var absolutePath = ResolveAbsolutePath(path);
+            var relativePath = BuildRelativePath(absolutePath);
+            if (!File.Exists(absolutePath))
+            {
+                return BuildAgentErrorHistory("Read File", $"File not found: {relativePath}.");
+            }
+
+            var hasRange = TryResolveLineRange(action, out var lineStart, out var lineEnd);
+            var rangeLabel = hasRange ? $"{lineStart}-{lineEnd}" : "full";
+            var readKey = BuildAgentReadKey(absolutePath, rangeLabel);
+            if (_agentReadMemory.TryGetValue(readKey, out var snapshot))
+            {
+                var hint = snapshot.truncated && !hasRange
+                    ? "Already read full file (truncated). Use a line range."
+                    : "Already read this file range.";
+                return BuildAgentStatusHistory("Read File", $"{relativePath} ({rangeLabel}): {hint}");
+            }
+
+            string content;
+            try
+            {
+                if (hasRange)
+                {
+                    var lines = File.ReadAllLines(absolutePath);
+                    if (lines.Length == 0)
+                    {
+                        content = string.Empty;
+                    }
+                    else
+                    {
+                        var startIndex = Mathf.Clamp(lineStart - 1, 0, lines.Length - 1);
+                        var endIndex = Mathf.Clamp(lineEnd - 1, startIndex, lines.Length - 1);
+                        var builder = new StringBuilder();
+                        for (var i = startIndex; i <= endIndex; i++)
+                        {
+                            builder.Append(i + 1);
+                            builder.Append(": ");
+                            builder.AppendLine(lines[i]);
+                        }
+                        content = builder.ToString();
+                    }
+                }
+                else
+                {
+                    content = File.ReadAllText(absolutePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                return BuildAgentErrorHistory("Read File", ex.Message);
+            }
+
+            var truncated = content.Length > AgentMaxToolOutputChars && AgentMaxToolOutputChars > 0;
+            var preview = ClampToolOutput(content, AgentMaxToolOutputChars);
+            _agentReadMemory[readKey] = new AgentReadSnapshot { truncated = truncated };
+            var displayPath = hasRange ? $"{relativePath} ({rangeLabel})" : relativePath;
+            await RunOnMainThread(() => AppendToolMessage("Read File", displayPath, preview)).ConfigureAwait(false);
+            return BuildAgentToolHistoryEntry("Read File", displayPath, preview);
+        }
+
+        private async Task<string> AgentWriteFileAsync(string path, string content, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return BuildAgentErrorHistory("Write File", "Missing path.");
+            }
+
+            if (content == null)
+            {
+                return BuildAgentErrorHistory("Write File", "Missing content.");
+            }
+
+            var absolutePath = ResolveAbsolutePath(path);
+            var relativePath = BuildRelativePath(absolutePath);
+            var shouldWrite = await RunOnMainThread(() =>
+            {
+                if (ProtoToolSettings.GetAutoConfirm() || ProtoToolSettings.GetFullAgentMode())
+                {
+                    return true;
+                }
+
+                return EditorUtility.DisplayDialog(
+                    "Confirm Write",
+                    $"Overwrite {relativePath}?",
+                    "Overwrite",
+                    "Cancel");
+            }).ConfigureAwait(false);
+
+            if (!shouldWrite)
+            {
+                return BuildAgentStatusHistory("Write File", "Canceled.");
+            }
+
+            await RunOnMainThread(() =>
+            {
+                var directory = Path.GetDirectoryName(absolutePath);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                File.WriteAllText(absolutePath, content);
+                AssetDatabase.Refresh();
+            }).ConfigureAwait(false);
+
+            InvalidateAgentReadMemory(absolutePath);
+
+            var preview = ClampToolOutput(content, AgentMaxToolOutputChars);
+            await RunOnMainThread(() => AppendToolMessage("Write File", relativePath, preview)).ConfigureAwait(false);
+            return BuildAgentToolHistoryEntry("Write File", relativePath, preview);
+        }
+
+        private async Task<string> AgentListFolderAsync(string path, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            var targetPath = string.IsNullOrWhiteSpace(path) ? Application.dataPath : ResolveAbsolutePath(path);
+            var relativePath = string.IsNullOrWhiteSpace(path) ? "Assets" : BuildRelativePath(targetPath);
+            if (!Directory.Exists(targetPath))
+            {
+                return BuildAgentErrorHistory("List Folder", $"Folder not found: {relativePath}.");
+            }
+
+            var listKey = BuildAgentToolKey("list", targetPath, null);
+            if (_agentToolCallHistory.Contains(listKey))
+            {
+                return BuildAgentStatusHistory("List Folder", $"{relativePath}: already listed.");
+            }
+            _agentToolCallHistory.Add(listKey);
+
+            var entries = Directory.GetFileSystemEntries(targetPath);
+            var previewList = new List<string>(Math.Min(entries.Length, 20));
+            for (var i = 0; i < entries.Length && previewList.Count < 20; i++)
+            {
+                previewList.Add(BuildRelativePath(entries[i]));
+            }
+
+            var body = previewList.Count == 0 ? "(empty)" : string.Join("\n", previewList);
+            await RunOnMainThread(() => AppendToolMessage("List Folder", relativePath, body)).ConfigureAwait(false);
+            return BuildAgentToolHistoryEntry("List Folder", relativePath, ClampToolOutput(body, AgentMaxToolOutputChars));
+        }
+
+        private async Task<string> AgentSearchTextAsync(string path, string query, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            var term = (query ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(term))
+            {
+                return BuildAgentErrorHistory("Search Text", "Missing query.");
+            }
+
+            var root = string.IsNullOrWhiteSpace(path) ? Application.dataPath : ResolveAbsolutePath(path);
+            var relativePath = string.IsNullOrWhiteSpace(path) ? "Assets" : BuildRelativePath(root);
+            var searchRoot = Directory.Exists(root) ? root : Application.dataPath;
+            var searchKey = BuildAgentToolKey("search", searchRoot, term);
+            if (_agentToolCallHistory.Contains(searchKey))
+            {
+                return BuildAgentStatusHistory("Search Text", $"{relativePath}: already searched for \"{term}\".");
+            }
+            _agentToolCallHistory.Add(searchKey);
+
+            var matches = new List<string>();
+            await Task.Run(() =>
+            {
+                foreach (var file in Directory.EnumerateFiles(searchRoot, "*.*", SearchOption.AllDirectories))
+                {
+                    if (IsIgnoredSearchPath(file))
+                    {
+                        continue;
+                    }
+
+                    if (file.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string fileContent;
+                    try
+                    {
+                        fileContent = File.ReadAllText(file);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (fileContent.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        matches.Add(BuildRelativePath(file));
+                        if (matches.Count >= 12)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }).ConfigureAwait(false);
+
+            var body = matches.Count == 0 ? "(no matches)" : string.Join("\n", matches);
+            await RunOnMainThread(() => AppendToolMessage("Search Text", relativePath, body)).ConfigureAwait(false);
+            return BuildAgentToolHistoryEntry("Search Text", relativePath, ClampToolOutput(body, AgentMaxToolOutputChars));
+        }
+
+        private static void AppendAgentHistory(List<string> history, string entry)
+        {
+            if (history == null || string.IsNullOrWhiteSpace(entry))
+            {
+                return;
+            }
+
+            history.Add(entry.Trim());
+            while (history.Count > AgentMaxHistoryEntries)
+            {
+                history.RemoveAt(0);
+            }
+        }
+
+        private static string ClampToolOutput(string content, int maxChars)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return string.Empty;
+            }
+
+            if (content.Length <= maxChars || maxChars <= 0)
+            {
+                return content;
+            }
+
+            return $"{content.Substring(0, maxChars)}\n... (truncated)";
+        }
+
+        private static bool TryResolveLineRange(ProtoAgentAction action, out int lineStart, out int lineEnd)
+        {
+            lineStart = 0;
+            lineEnd = 0;
+            if (action == null)
+            {
+                return false;
+            }
+
+            lineStart = action.lineStart;
+            lineEnd = action.lineEnd;
+
+            if (lineStart > 0 && lineEnd >= lineStart)
+            {
+                return true;
+            }
+
+            if (TryParseLineRange(action.range, out var parsedStart, out var parsedEnd))
+            {
+                lineStart = parsedStart;
+                lineEnd = parsedEnd;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryParseLineRange(string range, out int start, out int end)
+        {
+            start = 0;
+            end = 0;
+            if (string.IsNullOrWhiteSpace(range))
+            {
+                return false;
+            }
+
+            var normalized = range.Trim();
+            var match = Regex.Match(normalized, @"^(?<start>\d+)\s*[-:\.]{1,2}\s*(?<end>\d+)$");
+            if (!match.Success)
+            {
+                return false;
+            }
+
+            if (!int.TryParse(match.Groups["start"].Value, out start) ||
+                !int.TryParse(match.Groups["end"].Value, out end))
+            {
+                return false;
+            }
+
+            if (start <= 0 || end < start)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryParseAgentAction(string response, out ProtoAgentAction action)
+        {
+            action = null;
+            if (string.IsNullOrWhiteSpace(response))
+            {
+                return false;
+            }
+
+            var json = ExtractJson(response);
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                action = TryParseAgentActionJson(json);
+                if (IsValidAgentAction(action))
+                {
+                    return true;
+                }
+
+                var sanitized = SanitizeAgentJson(json);
+                if (!string.Equals(sanitized, json, StringComparison.Ordinal))
+                {
+                    action = TryParseAgentActionJson(sanitized);
+                    if (IsValidAgentAction(action))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            var fallbackInput = string.IsNullOrWhiteSpace(json) ? response : json;
+            return TryParseAgentActionFallback(fallbackInput, out action);
+        }
+
+        private static ProtoAgentAction TryParseAgentActionJson(string json)
+        {
+            try
+            {
+                return JsonUtility.FromJson<ProtoAgentAction>(json);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool TryParseAgentActionFallback(string input, out ProtoAgentAction action)
+        {
+            action = null;
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                return false;
+            }
+
+            var actionValue = ExtractLooseJsonStringValue(input, "action");
+            if (string.IsNullOrWhiteSpace(actionValue))
+            {
+                return false;
+            }
+
+            action = new ProtoAgentAction
+            {
+                action = actionValue,
+                path = ExtractLooseJsonStringValue(input, "path"),
+                content = ExtractLooseJsonStringValue(input, "content", true),
+                query = ExtractLooseJsonStringValue(input, "query"),
+                stage = ExtractLooseJsonStringValue(input, "stage"),
+                scope = ExtractLooseJsonStringValue(input, "scope"),
+                message = ExtractLooseJsonStringValue(input, "message"),
+                range = ExtractLooseJsonStringValue(input, "range"),
+                lineStart = ExtractLooseJsonIntValue(input, "lineStart", "line_start", "start"),
+                lineEnd = ExtractLooseJsonIntValue(input, "lineEnd", "line_end", "end")
+            };
+            return true;
+        }
+
+        private static bool IsValidAgentAction(ProtoAgentAction action)
+        {
+            return action != null && !string.IsNullOrWhiteSpace(action.action);
+        }
+
+        private static string SanitizeAgentJson(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return string.Empty;
+            }
+
+            var cleaned = Regex.Replace(json, ",\\s*(\\}|\\])", "$1");
+            if (cleaned.IndexOf('\"') < 0 && cleaned.IndexOf('\'') >= 0)
+            {
+                cleaned = cleaned.Replace('\'', '\"');
+            }
+            return cleaned;
+        }
+
+        private static string ExtractLooseJsonStringValue(string input, string key, bool requireQuotes = false)
+        {
+            if (string.IsNullOrWhiteSpace(input) || string.IsNullOrWhiteSpace(key))
+            {
+                return string.Empty;
+            }
+
+            string pattern;
+            if (requireQuotes)
+            {
+                pattern = $"(?i)(?:\\\"|')?{Regex.Escape(key)}(?:\\\"|')?\\s*:\\s*(?:\\\"(?<value>(?:\\\\.|[^\\\"\\\\])*)\\\"|'(?<value>(?:\\\\.|[^'\\\\])*)')";
+            }
+            else
+            {
+                pattern = $"(?i)(?:\\\"|')?{Regex.Escape(key)}(?:\\\"|')?\\s*:\\s*(?:\\\"(?<value>(?:\\\\.|[^\\\"\\\\])*)\\\"|'(?<value>(?:\\\\.|[^'\\\\])*)'|(?<value>[^,\\r\\n\\}}]+))";
+            }
+
+            var match = Regex.Match(input, pattern);
+            if (!match.Success)
+            {
+                return string.Empty;
+            }
+
+            var value = match.Groups["value"].Value.Trim();
+            if (value.IndexOf("\\", StringComparison.Ordinal) >= 0)
+            {
+                try
+                {
+                    value = Regex.Unescape(value);
+                }
+                catch
+                {
+                    // Leave as-is if unescape fails.
+                }
+            }
+
+            return value.Trim();
+        }
+
+        private static int ExtractLooseJsonIntValue(string input, params string[] keys)
+        {
+            if (string.IsNullOrWhiteSpace(input) || keys == null || keys.Length == 0)
+            {
+                return 0;
+            }
+
+            foreach (var key in keys)
+            {
+                var value = ExtractLooseJsonStringValue(input, key);
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    continue;
+                }
+
+                if (int.TryParse(value.Trim(), out var parsed))
+                {
+                    return parsed;
+                }
+            }
+
+            return 0;
+        }
+
+        private static string BuildAgentToolHistoryEntry(string title, string relativePath, string content)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine($"[{title}] {relativePath}");
+            if (!string.IsNullOrWhiteSpace(content))
+            {
+                builder.AppendLine(content.Trim());
+            }
+            return builder.ToString().Trim();
+        }
+
+        private static string BuildAgentStatusHistory(string title, string message)
+        {
+            var summary = string.IsNullOrWhiteSpace(message) ? "Completed." : message.Trim();
+            return $"[{title}] {summary}";
+        }
+
+        private static string BuildAgentErrorHistory(string title, string message)
+        {
+            var summary = string.IsNullOrWhiteSpace(message) ? "Unknown error." : message.Trim();
+            return $"[{title}] Error: {summary}";
+        }
+
+        private string BuildAgentReadKey(string absolutePath, string rangeLabel)
+        {
+            var normalized = string.IsNullOrWhiteSpace(absolutePath)
+                ? string.Empty
+                : Path.GetFullPath(absolutePath).Replace('\\', '/');
+            var range = string.IsNullOrWhiteSpace(rangeLabel) ? "full" : rangeLabel.Trim();
+            return $"{normalized}|{range}";
+        }
+
+        private string BuildAgentToolKey(string tool, string absolutePath, string query)
+        {
+            var normalizedPath = string.IsNullOrWhiteSpace(absolutePath)
+                ? string.Empty
+                : Path.GetFullPath(absolutePath).Replace('\\', '/');
+            var normalizedQuery = string.IsNullOrWhiteSpace(query) ? string.Empty : query.Trim().ToLowerInvariant();
+            return $"{tool}|{normalizedPath}|{normalizedQuery}";
+        }
+
+        private void InvalidateAgentReadMemory(string absolutePath)
+        {
+            if (string.IsNullOrWhiteSpace(absolutePath) || _agentReadMemory.Count == 0)
+            {
+                return;
+            }
+
+            var normalized = Path.GetFullPath(absolutePath).Replace('\\', '/');
+            var prefix = $"{normalized}|";
+            var toRemove = new List<string>();
+            foreach (var key in _agentReadMemory.Keys)
+            {
+                if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    toRemove.Add(key);
+                }
+            }
+
+            foreach (var key in toRemove)
+            {
+                _agentReadMemory.Remove(key);
+            }
+        }
+
+        private static bool IsContinuationPrompt(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                return false;
+            }
+
+            var normalized = NormalizeAgentToken(input);
+            return string.Equals(normalized, "continue", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(normalized, "continuar", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(normalized, "continua", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(normalized, "sigue", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(normalized, "seguir", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(normalized, "resume", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(normalized, "retomar", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildRecentChatContext(List<ProtoChatMessage> messages, int maxMessages)
+        {
+            if (messages == null || messages.Count == 0 || maxMessages <= 0)
+            {
+                return string.Empty;
+            }
+
+            var collected = new List<string>();
+            for (var i = messages.Count - 1; i >= 0 && collected.Count < maxMessages; i--)
+            {
+                var message = messages[i];
+                if (message == null || string.IsNullOrWhiteSpace(message.content))
+                {
+                    continue;
+                }
+
+                if (IsToolMessage(message.content) || message.content == "..." || message.content.StartsWith("Agent loop", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var prefix = string.Equals(message.role, RoleUser, StringComparison.OrdinalIgnoreCase) ? "User" : "Assistant";
+                collected.Add($"{prefix}: {message.content.Trim()}");
+            }
+
+            if (collected.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            collected.Reverse();
+            return string.Join("\n", collected);
+        }
+
+        private static bool IsToolMessage(string content)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return false;
+            }
+
+            return content.StartsWith("[Read File]", StringComparison.Ordinal) ||
+                   content.StartsWith("[Write File]", StringComparison.Ordinal) ||
+                   content.StartsWith("[List Folder]", StringComparison.Ordinal) ||
+                   content.StartsWith("[Search Text]", StringComparison.Ordinal);
+        }
+
+        private async Task MaybeCompactSessionAsync(CancellationToken token)
+        {
+            if (_isCompactingSession || !ShouldCompactSession())
+            {
+                return;
+            }
+
+            await CompactSessionAsync(token).ConfigureAwait(false);
+        }
+
+        private bool ShouldCompactSession()
+        {
+            if (_messages == null || _messages.Count == 0)
+            {
+                return false;
+            }
+
+            return CountConversationMessages() >= SessionCompactionThreshold;
+        }
+
+        private int CountConversationMessages()
+        {
+            var count = 0;
+            foreach (var message in _messages)
+            {
+                if (message == null || string.IsNullOrWhiteSpace(message.content))
+                {
+                    continue;
+                }
+
+                if (IsToolMessage(message.content) ||
+                    message.content == "..." ||
+                    message.content.StartsWith("Agent loop", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                count++;
+            }
+
+            return count;
+        }
+
+        private async Task CompactSessionAsync(CancellationToken token)
+        {
+            _isCompactingSession = true;
+            try
+            {
+                await RunOnMainThread(() =>
+                {
+                    _toolStatus = "Compacting session...";
+                    _status = "Compacting session...";
+                    Repaint();
+                }).ConfigureAwait(false);
+
+                var settings = await RunOnMainThread(GetSettingsSnapshot).ConfigureAwait(false);
+                if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
+                {
+                    await RunOnMainThread(() => { _toolStatus = "Skipping compaction: missing API key."; }).ConfigureAwait(false);
+                    return;
+                }
+
+                var messages = BuildCompactionMessages();
+                if (messages.Count == 0)
+                {
+                    return;
+                }
+
+                messages.Add(new ProtoChatMessage
+                {
+                    role = "user",
+                    content = ProtoPrompts.SessionCompactionInstruction
+                });
+
+                await RunOnMainThread(() => BeginApiWait("session compaction")).ConfigureAwait(false);
+                var response = await ProtoProviderClient.SendChatAsync(
+                    settings,
+                    messages.ToArray(),
+                    _apiWaitTimeoutSeconds,
+                    token).ConfigureAwait(false);
+                await RunOnMainThread(EndApiWait).ConfigureAwait(false);
+
+                if (!string.IsNullOrWhiteSpace(response))
+                {
+                    _sessionSummary = response.Trim();
+                    TrimSessionAfterCompaction();
+                    MarkChatHistoryDirty();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Ignore cancellation.
+            }
+            catch (Exception ex)
+            {
+                await RunOnMainThread(() => { _toolStatus = $"Compaction failed: {ex.Message}"; }).ConfigureAwait(false);
+            }
+            finally
+            {
+                await RunOnMainThread(() =>
+                {
+                    _isCompactingSession = false;
+                    _status = string.Empty;
+                    if (_toolStatus == "Compacting session...")
+                    {
+                        _toolStatus = string.Empty;
+                    }
+                    EndApiWait();
+                    Repaint();
+                }).ConfigureAwait(false);
+            }
+        }
+
+        private List<ProtoChatMessage> BuildCompactionMessages()
+        {
+            var baseMessages = BuildBaseContextMessages(false);
+            var messages = new List<ProtoChatMessage>(baseMessages);
+            var conversation = ExtractConversationMessages();
+            messages.AddRange(conversation);
+            return messages;
+        }
+
+        private List<ProtoChatMessage> ExtractConversationMessages()
+        {
+            var results = new List<ProtoChatMessage>();
+            var charCount = 0;
+
+            for (var i = _messages.Count - 1; i >= 0; i--)
+            {
+                var message = _messages[i];
+                if (message == null || string.IsNullOrWhiteSpace(message.content))
+                {
+                    continue;
+                }
+
+                if (IsToolMessage(message.content) ||
+                    message.content == "..." ||
+                    message.content.StartsWith("Agent loop", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var length = message.content.Length;
+                if (results.Count > 0 && charCount + length > SessionCompactionMaxChars)
+                {
+                    break;
+                }
+
+                charCount += length;
+                results.Add(message);
+            }
+
+            results.Reverse();
+            return results;
+        }
+
+        private void TrimSessionAfterCompaction()
+        {
+            if (_messages.Count <= SessionCompactionKeepMessages)
+            {
+                return;
+            }
+
+            var trimmed = new List<ProtoChatMessage>();
+            for (var i = _messages.Count - 1; i >= 0 && trimmed.Count < SessionCompactionKeepMessages; i--)
+            {
+                trimmed.Add(_messages[i]);
+            }
+
+            trimmed.Reverse();
+            _messages.Clear();
+            _messages.AddRange(trimmed);
+        }
+
+        private static bool IsIgnoredSearchPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return true;
+            }
+
+            var normalized = path.Replace('\\', '/');
+            return normalized.IndexOf("/Library/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalized.IndexOf("/Temp/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalized.IndexOf("/Obj/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalized.IndexOf("/Build/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalized.IndexOf("/Logs/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalized.IndexOf("/UserSettings/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalized.IndexOf("/ProjectSettings/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   normalized.IndexOf("/Packages/", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool AgentResponseRequestsUserInput(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                return false;
+            }
+
+            var lower = message.ToLowerInvariant();
+            if (lower.Contains("?"))
+            {
+                return true;
+            }
+
+            if (lower.Contains("necesito") ||
+                lower.Contains("need to") ||
+                lower.Contains("need the") ||
+                lower.Contains("i need") ||
+                lower.Contains("no puedo") ||
+                lower.Contains("cannot") ||
+                lower.Contains("can't") ||
+                lower.Contains("if you want") ||
+                lower.Contains("si quieres") ||
+                lower.Contains("please") ||
+                lower.Contains("por favor") ||
+                lower.Contains("pasame") ||
+                lower.Contains("pasa el") ||
+                lower.Contains("copia") ||
+                lower.Contains("copy") ||
+                lower.Contains("pega") ||
+                lower.Contains("paste") ||
+                lower.Contains("abre") ||
+                lower.Contains("open"))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string NormalizeAgentActionName(string action)
+        {
+            var normalized = NormalizeAgentToken(action);
+            switch (normalized)
+            {
+                case "applyplan":
+                    return "apply_plan";
+                case "applystage":
+                    return "apply_stage";
+                case "readfile":
+                    return "read_file";
+                case "writefile":
+                    return "write_file";
+                case "listfolder":
+                    return "list_folder";
+                case "searchtext":
+                    return "search_text";
+                case "fixpass":
+                    return "fix_pass";
+                default:
+                    return normalized;
+            }
+        }
+
+        private static string NormalizeAgentToken(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            var normalized = value.Trim().ToLowerInvariant();
+            normalized = normalized.Replace('-', '_');
+            normalized = Regex.Replace(normalized, "\\s+", "_");
+            return normalized;
+        }
+
+        private static bool TryResolveAgentStage(string stage, out string label, out string[] types)
+        {
+            label = null;
+            types = null;
+
+            if (string.IsNullOrWhiteSpace(stage))
+            {
+                return false;
+            }
+
+            var normalized = NormalizeAgentToken(stage);
+            if (normalized.Contains("folder"))
+            {
+                label = "folders";
+                types = new[] { "folder" };
+                return true;
+            }
+            if (normalized.Contains("script"))
+            {
+                label = "scripts";
+                types = new[] { "script" };
+                return true;
+            }
+            if (normalized.Contains("material"))
+            {
+                label = "materials";
+                types = new[] { "material" };
+                return true;
+            }
+            if (normalized.Contains("prefab"))
+            {
+                label = "prefabs";
+                types = new[] { "prefab", "prefab_component" };
+                return true;
+            }
+            if (normalized.Contains("scene"))
+            {
+                label = "scenes";
+                types = new[] { "scene", "scene_prefab", "scene_manager" };
+                return true;
+            }
+            if (normalized.Contains("asset"))
+            {
+                label = "assets";
+                types = new[] { "asset" };
+                return true;
+            }
+
+            return false;
+        }
+
+        private Task AppendAgentMessageAsync(string message)
+        {
+            var content = string.IsNullOrWhiteSpace(message) ? "Done." : message.Trim();
+            return RunOnMainThread(() =>
+            {
+                AddChatMessage(new ProtoChatMessage
+                {
+                    role = RoleAssistant,
+                    content = content
+                });
+                Repaint();
+            });
+        }
+
         private async Task ReviewScriptAsync(string userText)
         {
             _isSending = true;
@@ -399,25 +2655,25 @@ namespace ProtoTipAI.Editor
             var token = BeginOperation("review");
             _apiWaitTimeoutSeconds = 320;
 
-            _messages.Add(new ProtoChatMessage { role = RoleUser, content = userText });
+            AddChatMessage(new ProtoChatMessage { role = RoleUser, content = userText });
             var assistantIndex = _messages.Count;
-            _messages.Add(new ProtoChatMessage { role = RoleAssistant, content = "..." });
+            AddChatMessage(new ProtoChatMessage { role = RoleAssistant, content = "..." });
             Repaint();
 
             try
             {
                 var settings = await RunOnMainThread(GetSettingsSnapshot).ConfigureAwait(false);
-                if (string.IsNullOrWhiteSpace(settings.token))
+                if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
                 {
-                    _messages[assistantIndex].content = "Missing OpenAI token.";
-                    _status = "Missing OpenAI token.";
+                    UpdateChatMessageContent(assistantIndex, "Missing API key.");
+                    _status = "Missing API key.";
                     return;
                 }
 
                 var resolution = await RunOnMainThread(() => ResolveScriptPath(userText)).ConfigureAwait(false);
                 if (!resolution.success)
                 {
-                    _messages[assistantIndex].content = resolution.error;
+                    UpdateChatMessageContent(assistantIndex, resolution.error);
                     _status = resolution.error;
                     return;
                 }
@@ -426,7 +2682,7 @@ namespace ProtoTipAI.Editor
                 var fullPath = Path.GetFullPath(assetPath);
                 if (!File.Exists(fullPath))
                 {
-                    _messages[assistantIndex].content = $"Script not found at {assetPath}.";
+                    UpdateChatMessageContent(assistantIndex, $"Script not found at {assetPath}.");
                     _status = "Script not found.";
                     return;
                 }
@@ -438,16 +2694,16 @@ namespace ProtoTipAI.Editor
                 messages.Add(new ProtoChatMessage
                 {
                     role = "user",
-                    content = "Review the Unity C# script. If no changes are needed, respond with 'NO_CHANGES' and a brief reason. If changes are needed, first list up to 5 brief bullets, then output the full corrected file in a single ```csharp``` code block. Keep the class name and file intent consistent."
+                    content = ProtoPrompts.ReviewScriptInstruction
                 });
                 messages.Add(new ProtoChatMessage
                 {
                     role = "user",
-                    content = $"Script Path: {assetPath}\n\n{original}"
+                    content = string.Format(ProtoPrompts.ReviewScriptPayloadFormat, assetPath, original)
                 });
 
                 await RunOnMainThread(() => BeginApiWait($"review {Path.GetFileName(assetPath)}")).ConfigureAwait(false);
-                var response = await ProtoOpenAIClient.SendChatAsync(settings.token, settings.model, messages.ToArray(), _apiWaitTimeoutSeconds, token).ConfigureAwait(false);
+                var response = await ProtoProviderClient.SendChatAsync(settings, messages.ToArray(), _apiWaitTimeoutSeconds, token).ConfigureAwait(false);
                 await RunOnMainThread(EndApiWait).ConfigureAwait(false);
 
                 var summary = ExtractReviewSummary(response);
@@ -457,14 +2713,14 @@ namespace ProtoTipAI.Editor
                 {
                     if (response.IndexOf("NO_CHANGES", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        _messages[assistantIndex].content = string.IsNullOrWhiteSpace(summary)
+                        UpdateChatMessageContent(assistantIndex, string.IsNullOrWhiteSpace(summary)
                             ? "NO_CHANGES."
-                            : summary;
+                            : summary);
                         _status = string.Empty;
                         return;
                     }
 
-                    _messages[assistantIndex].content = "Review failed: no code returned.";
+                    UpdateChatMessageContent(assistantIndex, "Review failed: no code returned.");
                     _status = "Review failed.";
                     return;
                 }
@@ -496,17 +2752,17 @@ namespace ProtoTipAI.Editor
                     }
                 }
 
-                _messages[assistantIndex].content = summary;
+                UpdateChatMessageContent(assistantIndex, summary);
                 _status = string.Empty;
             }
             catch (OperationCanceledException)
             {
-                _messages[assistantIndex].content = "Canceled.";
+                UpdateChatMessageContent(assistantIndex, "Canceled.");
                 _status = "Canceled.";
             }
             catch (Exception ex)
             {
-                _messages[assistantIndex].content = "Error reviewing script.";
+                UpdateChatMessageContent(assistantIndex, "Error reviewing script.");
                 _status = ex.Message;
             }
             finally
@@ -529,21 +2785,21 @@ namespace ProtoTipAI.Editor
                 }
             };
 
-            var projectGoal = ProtoOpenAISettings.GetProjectGoal();
+            var projectGoal = ProtoProjectSettings.GetProjectGoal();
             if (!string.IsNullOrWhiteSpace(projectGoal))
             {
                 messages.Add(new ProtoChatMessage
                 {
                     role = "system",
-                    content = $"Project Goal:\n{projectGoal.Trim()}"
+                    content = string.Format(ProtoPrompts.ProjectGoalFormat, projectGoal.Trim())
                 });
             }
 
-            var summary = ProtoOpenAISettings.GetProjectSummary();
+            var summary = ProtoProjectSettings.GetProjectSummary();
             if (string.IsNullOrWhiteSpace(summary))
             {
                 summary = ProtoProjectContext.BuildProjectSummary();
-                ProtoOpenAISettings.SetProjectSummary(summary);
+                ProtoProjectSettings.SetProjectSummary(summary);
             }
 
             if (!string.IsNullOrWhiteSpace(summary))
@@ -551,7 +2807,16 @@ namespace ProtoTipAI.Editor
                 messages.Add(new ProtoChatMessage
                 {
                     role = "system",
-                    content = $"Project Summary:\n{summary.Trim()}"
+                    content = string.Format(ProtoPrompts.ProjectSummaryFormat, summary.Trim())
+                });
+            }
+
+            if (!string.IsNullOrWhiteSpace(_sessionSummary))
+            {
+                messages.Add(new ProtoChatMessage
+                {
+                    role = "system",
+                    content = string.Format(ProtoPrompts.SessionSummaryFormat, _sessionSummary.Trim())
                 });
             }
 
@@ -563,7 +2828,7 @@ namespace ProtoTipAI.Editor
                     messages.Add(new ProtoChatMessage
                     {
                         role = "user",
-                        content = $"Context Snapshot:\n{dynamicContext.Trim()}"
+                        content = string.Format(ProtoPrompts.ContextSnapshotFormat, dynamicContext.Trim())
                     });
                 }
             }
@@ -614,8 +2879,7 @@ namespace ProtoTipAI.Editor
 
         private static string GetPlanRawPath()
         {
-            var folder = ProtoFeatureRequestStore.EnsureFeatureRequestFolder();
-            return $"{folder}/{PlanRawFileName}";
+            return Path.GetFullPath(ProtoPlanStorage.GetPlanRawPath());
         }
 
         private void ApplyPlanJsonToState(string json)
@@ -666,7 +2930,7 @@ namespace ProtoTipAI.Editor
             {
                 var settings = await RunOnMainThread(GetSettingsSnapshot).ConfigureAwait(false);
                 var prompt = string.IsNullOrWhiteSpace(_planPrompt)
-                    ? "Create the folder structure and list of Unity C# scripts needed first."
+                    ? ProtoPrompts.DefaultPlanPrompt
                     : _planPrompt.Trim();
 
                 var scriptIndex = await RunOnMainThread(BuildScriptIndexMarkdown).ConfigureAwait(false);
@@ -674,7 +2938,7 @@ namespace ProtoTipAI.Editor
                 var sceneIndex = await RunOnMainThread(BuildSceneIndexMarkdown).ConfigureAwait(false);
                 var assetIndex = await RunOnMainThread(BuildAssetIndexMarkdown).ConfigureAwait(false);
                 var baseMessages = await RunOnMainThread(() => BuildBaseContextMessages(true).ToArray()).ConfigureAwait(false);
-                var phasePlan = await GeneratePhasedPlanAsync(settings.token, settings.model, baseMessages, prompt, token, scriptIndex, prefabIndex, sceneIndex, assetIndex).ConfigureAwait(false);
+                var phasePlan = await GeneratePhasedPlanAsync(settings, baseMessages, prompt, token, scriptIndex, prefabIndex, sceneIndex, assetIndex).ConfigureAwait(false);
 
                 EditorApplication.delayCall += () =>
                 {
@@ -746,7 +3010,9 @@ namespace ProtoTipAI.Editor
                     }
 
                     var featureRequests = BuildFeatureRequestList(phaseRequests.ToArray());
+                    featureRequests = ExpandFeatureSteps(featureRequests);
                     featureRequests = FilterExistingScriptRequests(featureRequests);
+                    featureRequests = ExpandPrefabAndSceneDetails(featureRequests);
                     featureRequests = PreflightRequestsForWrite(featureRequests);
                     await RunOnMainThread(() => WriteFeatureRequests(featureRequests)).ConfigureAwait(false);
                 }
@@ -762,7 +3028,9 @@ namespace ProtoTipAI.Editor
                     }
 
                     var featureRequests = BuildFeatureRequestList(plan.featureRequests);
+                    featureRequests = ExpandFeatureSteps(featureRequests);
                     featureRequests = FilterExistingScriptRequests(featureRequests);
+                    featureRequests = ExpandPrefabAndSceneDetails(featureRequests);
                     featureRequests = PreflightRequestsForWrite(featureRequests);
                     await RunOnMainThread(() => WriteFeatureRequests(featureRequests)).ConfigureAwait(false);
                 }
@@ -787,11 +3055,21 @@ namespace ProtoTipAI.Editor
 
         private async Task ApplyPlanAsync()
         {
+            var token = BeginOperation("apply plan");
+            await ApplyPlanInternalAsync(token, true).ConfigureAwait(false);
+        }
+
+        private async Task ApplyPlanInternalAsync(CancellationToken token, bool ownsOperation)
+        {
             _isApplyingPlan = true;
             _toolStatus = "Applying feature requests...";
             _cancelRequested = false;
-            var token = BeginOperation("apply plan");
-            Repaint();
+            _lastFixPassTargets = null;
+            _lastFixPassLabel = string.Empty;
+            if (ownsOperation)
+            {
+                Repaint();
+            }
 
             try
             {
@@ -800,8 +3078,11 @@ namespace ProtoTipAI.Editor
                 {
                     _toolStatus = "No feature requests found. Create them first.";
                     _isApplyingPlan = false;
-                    EndOperation();
-                    Repaint();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                        Repaint();
+                    }
                     return;
                 }
 
@@ -829,7 +3110,10 @@ namespace ProtoTipAI.Editor
                 {
                     _toolStatus = "Feature requests applied.";
                     _isApplyingPlan = false;
-                    EndOperation();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                    }
                     Repaint();
                 }).ConfigureAwait(false);
             }
@@ -840,7 +3124,10 @@ namespace ProtoTipAI.Editor
                     _toolStatus = "Canceled.";
                     _isApplyingPlan = false;
                     EndAutoRefreshBlock(true);
-                    EndOperation();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                    }
                     Repaint();
                 };
             }
@@ -851,34 +3138,61 @@ namespace ProtoTipAI.Editor
                     _toolStatus = ex.Message;
                     _isApplyingPlan = false;
                     EndAutoRefreshBlock(true);
-                    EndOperation();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                    }
                     Repaint();
                 };
             }
         }
 
-        private async Task RunFixPassAsync()
+        private async Task RunFixPassAsync(HashSet<string> targetScriptPaths = null, string passLabel = null)
         {
-            _isFixingErrors = true;
-            _toolStatus = "Fix pass running...";
-            _cancelRequested = false;
             var token = BeginOperation("fix pass");
+            await RunFixPassInternalAsync(targetScriptPaths, passLabel, token, true).ConfigureAwait(false);
+        }
+
+        private async Task RunFixPassInternalAsync(HashSet<string> targetScriptPaths, string passLabel, CancellationToken token, bool ownsOperation)
+        {
+            var effectiveTargets = targetScriptPaths ?? _lastFixPassTargets;
+            var effectiveLabel = !string.IsNullOrWhiteSpace(passLabel)
+                ? passLabel
+                : (targetScriptPaths == null ? _lastFixPassLabel : string.Empty);
+            _isFixingErrors = true;
+            var labelSuffix = string.IsNullOrWhiteSpace(effectiveLabel) ? string.Empty : $" ({effectiveLabel})";
+            _toolStatus = $"Fix pass{labelSuffix} running...";
+            _cancelRequested = false;
             _apiWaitTimeoutSeconds = 320;
-            Repaint();
+            if (ownsOperation)
+            {
+                Repaint();
+            }
 
             try
             {
+                var targetPaths = effectiveTargets != null && effectiveTargets.Count > 0
+                    ? new HashSet<string>(effectiveTargets, StringComparer.OrdinalIgnoreCase)
+                    : null;
+
                 for (var iteration = 0; iteration < _fixPassIterations; iteration++)
                 {
                     token.ThrowIfCancellationRequested();
+                    await WaitForCompilationAsync(token).ConfigureAwait(false);
                     var errors = await RunOnMainThread(GetConsoleErrorItems).ConfigureAwait(false);
+                    if (targetPaths != null)
+                    {
+                        errors = FilterErrorsByScriptPaths(errors, targetPaths);
+                    }
                     if (errors.Count == 0)
                     {
-                        _toolStatus = "Fix pass complete. No console errors.";
+                        _toolStatus = targetPaths == null
+                            ? "Fix pass complete. No console errors."
+                            : $"Fix pass{labelSuffix} complete. No errors in target scripts.";
                         break;
                     }
 
-                    _toolStatus = $"Fixing errors (pass {iteration + 1}/{_fixPassIterations})...";
+                    _toolStatus = $"Fixing errors{labelSuffix} (pass {iteration + 1}/{_fixPassIterations})...";
                     EditorApplication.delayCall += Repaint;
 
                     var scriptIndex = await RunOnMainThread(BuildScriptIndexMarkdown).ConfigureAwait(false);
@@ -892,7 +3206,7 @@ namespace ProtoTipAI.Editor
                             continue;
                         }
 
-                        await FixScriptErrorAsync(error, settings.token, settings.model, token, scriptIndex).ConfigureAwait(false);
+                        await FixScriptErrorAsync(error, settings, token, scriptIndex).ConfigureAwait(false);
                     }
 
                     await RunOnMainThread(() => EndAutoRefreshBlock(true)).ConfigureAwait(false);
@@ -909,12 +3223,15 @@ namespace ProtoTipAI.Editor
             finally
             {
                 _isFixingErrors = false;
-                EndOperation();
+                if (ownsOperation)
+                {
+                    EndOperation();
+                }
                 Repaint();
             }
         }
 
-        private async Task FixScriptErrorAsync(ConsoleErrorItem error, string apiToken, string model, CancellationToken token, string scriptIndex)
+        private async Task FixScriptErrorAsync(ConsoleErrorItem error, ProtoProviderSnapshot settings, CancellationToken token, string scriptIndex)
         {
             var assetPath = NormalizeErrorAssetPath(error.filePath);
             if (string.IsNullOrWhiteSpace(assetPath))
@@ -934,40 +3251,42 @@ namespace ProtoTipAI.Editor
             var clampedIndex = ClampScriptIndex(scriptIndex);
             AppendScriptIndexMessage(messages, clampedIndex);
 
-            var missingType = ExtractMissingTypeName(error.message);
-            if (!string.IsNullOrWhiteSpace(missingType))
+            var fixContext = await RunOnMainThread(() => BuildFixPassContext(error)).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(fixContext))
             {
-                var existsInIndex = ScriptIndexContainsType(clampedIndex, missingType);
                 messages.Add(new ProtoChatMessage
                 {
                     role = "system",
-                    content = existsInIndex
-                        ? $"Type '{missingType}' exists in Script Index. Use the existing type or correct the reference."
-                        : $"Type '{missingType}' not found in Script Index. If needed, add a minimal definition in this file or replace with a valid type."
+                    content = string.Format(ProtoPrompts.FixContextFormat, fixContext)
                 });
             }
 
             messages.Add(new ProtoChatMessage
             {
                 role = "system",
-                content = "Unity constraints: attributes like [Header], [Tooltip], [Range], [SerializeField] only apply to fields/properties that Unity serializes (not events, methods, or local variables). Use UnityEvent for inspector-exposed events. MonoBehaviour class name must match the file name. Avoid constructors; use Awake/Start. Do not use Unity API from constructors or field initializers."
+                content = ProtoPrompts.FixAutoModeInstruction
+            });
+
+            messages.Add(new ProtoChatMessage
+            {
+                role = "system",
+                content = ProtoPrompts.FixUnityConstraints
             });
 
             messages.Add(new ProtoChatMessage
             {
                 role = "user",
-                content = "Fix the Unity C# script for the provided compile error. Output only full corrected code in a single ```csharp``` block. Do not add explanations. Use the Script Index to resolve names; avoid inventing types. If you must introduce a missing type, prefer a minimal enum/class in this file."
+                content = ProtoPrompts.FixScriptInstruction
             });
             messages.Add(new ProtoChatMessage
             {
                 role = "user",
-                content = $"Error: {error.message}\nFile: {assetPath}\nLine: {error.line}\n\n{original}"
+                content = string.Format(ProtoPrompts.FixErrorPayloadFormat, error.message, assetPath, error.line, original)
             });
 
             await RunOnMainThread(() => BeginApiWait($"fix {Path.GetFileName(assetPath)}")).ConfigureAwait(false);
-            var response = await ProtoOpenAIClient.SendChatAsync(
-                apiToken,
-                model,
+            var response = await ProtoProviderClient.SendChatAsync(
+                settings,
                 messages.ToArray(),
                 _apiWaitTimeoutSeconds,
                 token).ConfigureAwait(false);
@@ -1035,7 +3354,6 @@ namespace ProtoTipAI.Editor
             var conditionField = logEntryType.GetField("condition", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
             var fileField = logEntryType.GetField("file", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
             var lineField = logEntryType.GetField("line", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
-            var modeField = logEntryType.GetField("mode", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
             var typeField = logEntryType.GetField("type", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
 
             for (var i = 0; i < count; i++)
@@ -1048,13 +3366,40 @@ namespace ProtoTipAI.Editor
                 {
                     line = Convert.ToInt32(lineField.GetValue(entry));
                 }
+                var typeValue = typeField?.GetValue(entry) as string ?? string.Empty;
 
                 results.Add(new ConsoleErrorItem
                 {
                     message = message,
                     filePath = file,
-                    line = line
+                    line = line,
+                    type = typeValue
                 });
+            }
+
+            return results;
+        }
+
+        private static List<ConsoleErrorItem> FilterErrorsByScriptPaths(List<ConsoleErrorItem> errors, HashSet<string> targetScriptPaths)
+        {
+            if (errors == null || errors.Count == 0 || targetScriptPaths == null || targetScriptPaths.Count == 0)
+            {
+                return errors ?? new List<ConsoleErrorItem>();
+            }
+
+            var results = new List<ConsoleErrorItem>();
+            foreach (var error in errors)
+            {
+                var assetPath = NormalizeErrorAssetPath(error.filePath);
+                if (string.IsNullOrWhiteSpace(assetPath))
+                {
+                    continue;
+                }
+
+                if (targetScriptPaths.Contains(assetPath))
+                {
+                    results.Add(error);
+                }
             }
 
             return results;
@@ -1065,15 +3410,24 @@ namespace ProtoTipAI.Editor
             public string message;
             public string filePath;
             public int line;
+            public string type;
         }
 
         private async Task ApplyPlanStageAsync(string label, string[] types)
         {
+            var token = BeginOperation($"apply {label}");
+            await ApplyPlanStageInternalAsync(label, types, token, true).ConfigureAwait(false);
+        }
+
+        private async Task ApplyPlanStageInternalAsync(string label, string[] types, CancellationToken token, bool ownsOperation)
+        {
             _isApplyingStage = true;
             _toolStatus = $"Applying {label}...";
             _cancelRequested = false;
-            var token = BeginOperation($"apply {label}");
-            Repaint();
+            if (ownsOperation)
+            {
+                Repaint();
+            }
 
             try
             {
@@ -1082,21 +3436,84 @@ namespace ProtoTipAI.Editor
                 {
                     _toolStatus = "No feature requests found. Create them first.";
                     _isApplyingStage = false;
-                    EndOperation();
-                    Repaint();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                        Repaint();
+                    }
                     return;
                 }
 
                 featureRequests = await RunOnMainThread(() => PreflightRequestsForExecution(featureRequests)).ConfigureAwait(false);
                 _scriptIndexDirty = true;
                 var requestLookup = BuildRequestLookup(featureRequests);
-                var stageRequests = FilterRequestsByTypes(featureRequests, types);
+                var scriptByName = BuildScriptRequestMap(featureRequests);
+
+                var phaseId = GetSelectedPhaseId();
+                var phaseLabel = GetSelectedPhaseLabel();
+                var phaseRequests = FilterRequestsByPhase(featureRequests, phaseId);
+                if (phaseRequests.Count == 0)
+                {
+                    var phaseMessage = !string.IsNullOrWhiteSpace(phaseLabel)
+                        ? $" for {phaseLabel}"
+                        : (!string.IsNullOrWhiteSpace(phaseId) ? " for the selected phase" : string.Empty);
+                    _toolStatus = $"No feature requests found{phaseMessage}.";
+                    _isApplyingStage = false;
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                        Repaint();
+                    }
+                    return;
+                }
+
+                var stageRequests = FilterRequestsByTypes(phaseRequests, types);
                 if (stageRequests.Count == 0)
                 {
-                    _toolStatus = $"No {label} requests found.";
+                    var phaseSuffix = !string.IsNullOrWhiteSpace(phaseLabel)
+                        ? $" in {phaseLabel}"
+                        : (!string.IsNullOrWhiteSpace(phaseId) ? " in the selected phase" : string.Empty);
+                    _toolStatus = $"No {label} requests found{phaseSuffix}.";
                     _isApplyingStage = false;
-                    EndOperation();
-                    Repaint();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                        Repaint();
+                    }
+                    return;
+                }
+
+                var stageScriptTargets = CollectStageScriptPaths(stageRequests, requestLookup, scriptByName);
+                var shouldApplyStage = await RunOnMainThread(() =>
+                {
+                    if (ProtoToolSettings.GetFullAgentMode())
+                    {
+                        return true;
+                    }
+
+                    var phaseDescription = !string.IsNullOrWhiteSpace(phaseLabel)
+                        ? phaseLabel
+                        : (!string.IsNullOrWhiteSpace(phaseId) ? $"phase {phaseId}" : "all phases");
+                    var stageDescription = $"{label} stage for {phaseDescription}";
+                    return EditorUtility.DisplayDialog(
+                        "Confirm Stage",
+                        $"Apply {stageDescription}? This may modify assets in your project.",
+                        "Apply",
+                        "Cancel");
+                }).ConfigureAwait(false);
+
+                if (!shouldApplyStage)
+                {
+                    await RunOnMainThread(() =>
+                    {
+                        _toolStatus = "Stage canceled.";
+                        _isApplyingStage = false;
+                        if (ownsOperation)
+                        {
+                            EndOperation();
+                        }
+                        Repaint();
+                    }).ConfigureAwait(false);
                     return;
                 }
 
@@ -1123,9 +3540,16 @@ namespace ProtoTipAI.Editor
                 {
                     _toolStatus = $"{label} applied.";
                     _isApplyingStage = false;
-                    EndOperation();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                    }
                     Repaint();
                 }).ConfigureAwait(false);
+
+                _lastFixPassTargets = stageScriptTargets != null && stageScriptTargets.Count > 0 ? stageScriptTargets : null;
+                _lastFixPassLabel = _lastFixPassTargets == null ? string.Empty : label;
+                await MaybeRunStageFixPassAsync(stageScriptTargets, label).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -1133,7 +3557,10 @@ namespace ProtoTipAI.Editor
                 {
                     _toolStatus = "Canceled.";
                     _isApplyingStage = false;
-                    EndOperation();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                    }
                     Repaint();
                 };
             }
@@ -1143,9 +3570,171 @@ namespace ProtoTipAI.Editor
                 {
                     _toolStatus = ex.Message;
                     _isApplyingStage = false;
-                    EndOperation();
+                    if (ownsOperation)
+                    {
+                        EndOperation();
+                    }
                     Repaint();
                 };
+            }
+        }
+
+        private async Task MaybeRunStageFixPassAsync(HashSet<string> stageScriptTargets, string stageLabel)
+        {
+            if (stageScriptTargets == null || stageScriptTargets.Count == 0 || _isFixingErrors)
+            {
+                return;
+            }
+
+            await WaitForCompilationAsync(CancellationToken.None).ConfigureAwait(false);
+            var errors = await RunOnMainThread(GetConsoleErrorItems).ConfigureAwait(false);
+            var stageErrors = FilterErrorsByScriptPaths(errors, stageScriptTargets);
+            if (stageErrors.Count == 0)
+            {
+                return;
+            }
+
+            if (!ProtoProviderSettings.HasApiKey())
+            {
+                _toolStatus = $"Fix pass skipped for {stageLabel}: missing API key.";
+                return;
+            }
+
+            await RunFixPassAsync(stageScriptTargets, stageLabel).ConfigureAwait(false);
+        }
+
+        private static HashSet<string> CollectStageScriptPaths(
+            List<ProtoFeatureRequest> stageRequests,
+            Dictionary<string, ProtoFeatureRequest> requestLookup,
+            Dictionary<string, ProtoFeatureRequest> scriptByName)
+        {
+            var results = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (stageRequests == null || stageRequests.Count == 0)
+            {
+                return results;
+            }
+
+            foreach (var request in stageRequests)
+            {
+                if (request == null)
+                {
+                    continue;
+                }
+
+                AddScriptPathFromRequest(request, results);
+
+                if (string.Equals(request.type, "prefab_component", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(request.type, "scene_manager", StringComparison.OrdinalIgnoreCase))
+                {
+                    AddScriptPathFromName(request.name, scriptByName, results);
+                }
+
+                if (request.dependsOn != null && requestLookup != null)
+                {
+                    foreach (var depId in request.dependsOn)
+                    {
+                        if (string.IsNullOrWhiteSpace(depId))
+                        {
+                            continue;
+                        }
+
+                        if (requestLookup.TryGetValue(depId, out var depRequest))
+                        {
+                            AddScriptPathFromRequest(depRequest, results);
+                        }
+                    }
+                }
+
+                if (request.steps != null)
+                {
+                    foreach (var step in request.steps)
+                    {
+                        if (step == null)
+                        {
+                            continue;
+                        }
+
+                        if (step.dependsOn != null && requestLookup != null)
+                        {
+                            foreach (var depId in step.dependsOn)
+                            {
+                                if (string.IsNullOrWhiteSpace(depId))
+                                {
+                                    continue;
+                                }
+
+                                if (requestLookup.TryGetValue(depId, out var depRequest))
+                                {
+                                    AddScriptPathFromRequest(depRequest, results);
+                                }
+                            }
+                        }
+
+                        if (string.Equals(step.type, "prefab_component", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(step.type, "scene_manager", StringComparison.OrdinalIgnoreCase))
+                        {
+                            AddScriptPathFromName(step.name, scriptByName, results);
+                        }
+                    }
+                }
+            }
+
+            return results;
+        }
+
+        private static void AddScriptPathFromName(string scriptName, Dictionary<string, ProtoFeatureRequest> scriptByName, HashSet<string> results)
+        {
+            if (string.IsNullOrWhiteSpace(scriptName) || scriptByName == null || results == null)
+            {
+                return;
+            }
+
+            if (scriptByName.TryGetValue(scriptName.Trim(), out var scriptRequest))
+            {
+                AddScriptPathFromRequest(scriptRequest, results);
+            }
+        }
+
+        private static void AddScriptPathFromRequest(ProtoFeatureRequest request, HashSet<string> results)
+        {
+            if (request == null || results == null)
+            {
+                return;
+            }
+
+            if (!string.Equals(request.type, "script", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var name = request.name?.Trim();
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return;
+            }
+
+            var folder = NormalizeFolderPath(request.path);
+            if (string.IsNullOrWhiteSpace(folder))
+            {
+                return;
+            }
+
+            var assetPath = EnsureProjectPath($"{folder}/{name}.cs");
+            results.Add(assetPath);
+        }
+
+        private async Task WaitForCompilationAsync(CancellationToken token)
+        {
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                var isCompiling = await RunOnMainThread(() => EditorApplication.isCompiling).ConfigureAwait(false);
+                if (!isCompiling)
+                {
+                    return;
+                }
+
+                await Task.Delay(200, token).ConfigureAwait(false);
             }
         }
 
@@ -1361,10 +3950,16 @@ namespace ProtoTipAI.Editor
                     return "[Script]";
                 case "scene":
                     return "[Scene]";
+                case "scene_prefab":
+                    return "[ScenePrefab]";
+                case "scene_manager":
+                    return "[SceneMgr]";
                 case "asset":
                     return "[Asset]";
                 case "prefab":
                     return "[Prefab]";
+                case "prefab_component":
+                    return "[PrefabComp]";
                 case "material":
                     return "[Material]";
                 default:
@@ -1374,10 +3969,10 @@ namespace ProtoTipAI.Editor
 
         private static string NormalizeStatus(string status)
         {
-            return string.IsNullOrWhiteSpace(status) ? "todo" : status.Trim();
+            return status.ToStatus().ToNormalizedString();
         }
 
-        private async Task<bool> ApplyRequestAsync(ProtoFeatureRequest request, string token, string model, ProtoChatMessage[] baseMessages, Dictionary<string, ProtoFeatureRequest> requestLookup, CancellationToken cancellationToken)
+        private async Task<bool> ApplyRequestAsync(ProtoFeatureRequest request, ProtoProviderSnapshot settings, ProtoChatMessage[] baseMessages, Dictionary<string, ProtoFeatureRequest> requestLookup, CancellationToken cancellationToken)
         {
             if (request == null || string.IsNullOrWhiteSpace(request.type))
             {
@@ -1399,12 +3994,12 @@ namespace ProtoTipAI.Editor
                     }, false).ConfigureAwait(false);
                     return string.IsNullOrWhiteSpace(folderError);
                 case "script":
-                    if (string.IsNullOrWhiteSpace(token))
+                    if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
                     {
-                        request.notes = AppendNote(request.notes, "Missing OpenAI token.");
+                        request.notes = AppendNote(request.notes, "Missing API key.");
                         return false;
                     }
-                    return await GenerateScriptForRequestAsync(request, token, model, baseMessages, requestLookup, cancellationToken).ConfigureAwait(false);
+                    return await GenerateScriptForRequestAsync(request, settings, baseMessages, requestLookup, cancellationToken).ConfigureAwait(false);
                 case "prefab":
                     var prefabError = string.Empty;
                     await RunAssetEditingAsync(() =>
@@ -1415,6 +4010,8 @@ namespace ProtoTipAI.Editor
                         }
                     }, false).ConfigureAwait(false);
                     return string.IsNullOrWhiteSpace(prefabError);
+                case "prefab_component":
+                    return await ApplyPrefabComponentRequestAsync(request, requestLookup).ConfigureAwait(false);
                 case "material":
                     var materialError = string.Empty;
                     await RunAssetEditingAsync(() =>
@@ -1429,9 +4026,9 @@ namespace ProtoTipAI.Editor
                     var sceneError = string.Empty;
                     var sceneName = GetSceneName(request);
                     var scenePath = BuildScenePath(request.path, sceneName, out _);
-                    if (!string.IsNullOrWhiteSpace(token))
+                    if (settings != null && !string.IsNullOrWhiteSpace(settings.ApiKey))
                     {
-                        var suggestedNotes = await RequestSceneNotesAsync(request, requestLookup, token, model, cancellationToken).ConfigureAwait(false);
+                        var suggestedNotes = await RequestSceneNotesAsync(request, requestLookup, settings, cancellationToken).ConfigureAwait(false);
                         if (!string.IsNullOrWhiteSpace(suggestedNotes))
                         {
                             request.notes = suggestedNotes;
@@ -1445,17 +4042,143 @@ namespace ProtoTipAI.Editor
                             request.notes = AppendNote(request.notes, sceneError);
                         }
                     }, false).ConfigureAwait(false);
-                    if (string.IsNullOrWhiteSpace(sceneError) && !string.IsNullOrWhiteSpace(token))
+                    if (string.IsNullOrWhiteSpace(sceneError) && settings != null && !string.IsNullOrWhiteSpace(settings.ApiKey))
                     {
-                        EnqueueSceneLayout(request, requestLookup, token, model, scenePath);
+                        EnqueueSceneLayout(request, requestLookup, settings, scenePath);
                     }
                     return string.IsNullOrWhiteSpace(sceneError);
+                case "scene_prefab":
+                    return await ApplyScenePrefabRequestAsync(request, requestLookup).ConfigureAwait(false);
+                case "scene_manager":
+                    return await ApplySceneManagerRequestAsync(request, requestLookup).ConfigureAwait(false);
                 case "asset":
                     return await ApplyAssetFallbackAsync(request, requestLookup).ConfigureAwait(false);
                 default:
                     request.notes = AppendNote(request.notes, "Type not supported by automation yet.");
                     return false;
             }
+        }
+
+        private async Task<bool> ApplyPrefabComponentRequestAsync(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup)
+        {
+            if (request == null)
+            {
+                return false;
+            }
+
+            var unresolvedNames = new List<string>();
+            var propertyFlags = ExtractComponentPropertyFlags(request.name);
+            List<string> componentNames = null;
+            await RunOnMainThread(() =>
+            {
+                componentNames = ResolveComponentNamesForRequest(request, unresolvedNames);
+            }).ConfigureAwait(false);
+            if (componentNames == null || componentNames.Count == 0)
+            {
+                request.notes = AppendNote(request.notes, "Prefab component name is missing.");
+                return false;
+            }
+
+            var prefabPath = ResolvePrefabPathForComponentRequest(request, requestLookup);
+            if (string.IsNullOrWhiteSpace(prefabPath))
+            {
+                request.notes = AppendNote(request.notes, "Prefab path is missing.");
+                return false;
+            }
+
+            AttachmentResult result = default;
+            var propertyError = string.Empty;
+            await RunOnMainThread(() =>
+            {
+                result = AttachComponentsToPrefab(prefabPath, componentNames);
+                if (propertyFlags.Count > 0)
+                {
+                    propertyError = ApplyPrefabComponentPropertyFlags(prefabPath, componentNames, propertyFlags);
+                }
+            }).ConfigureAwait(false);
+
+            if (!string.IsNullOrWhiteSpace(result.error) &&
+                !string.Equals(result.error, "No prefab components added.", StringComparison.OrdinalIgnoreCase))
+            {
+                request.notes = AppendNote(request.notes, result.error);
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(propertyError))
+            {
+                request.notes = AppendNote(request.notes, propertyError);
+            }
+
+            if (unresolvedNames.Count > 0)
+            {
+                request.notes = AppendNote(request.notes, $"Unresolved component names: {string.Join(", ", unresolvedNames)}.");
+            }
+
+            return true;
+        }
+
+        private async Task<bool> ApplyScenePrefabRequestAsync(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup)
+        {
+            return await ApplySceneDetailRequestAsync(request, requestLookup, AddScenePrefabs).ConfigureAwait(false);
+        }
+
+        private async Task<bool> ApplySceneManagerRequestAsync(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup)
+        {
+            return await ApplySceneDetailRequestAsync(request, requestLookup, AddSceneManagers).ConfigureAwait(false);
+        }
+
+        private async Task<bool> ApplySceneDetailRequestAsync(
+            ProtoFeatureRequest request,
+            Dictionary<string, ProtoFeatureRequest> requestLookup,
+            Action<ProtoFeatureRequest, Dictionary<string, ProtoFeatureRequest>, UnityEngine.SceneManagement.Scene> applyAction)
+        {
+            if (request == null)
+            {
+                return false;
+            }
+
+            var scenePath = ResolveScenePathForDetailRequest(request, requestLookup);
+            if (string.IsNullOrWhiteSpace(scenePath))
+            {
+                request.notes = AppendNote(request.notes, "Scene path is missing.");
+                return false;
+            }
+
+            var error = string.Empty;
+            await RunOnMainThread(() =>
+            {
+                if (!EnsureAdditiveSceneCreationPossible(out error))
+                {
+                    return;
+                }
+
+                var scene = UnityEditor.SceneManagement.EditorSceneManager.OpenScene(
+                    scenePath,
+                    UnityEditor.SceneManagement.OpenSceneMode.Additive);
+                if (!scene.IsValid())
+                {
+                    error = $"Failed to open scene at {scenePath}.";
+                    return;
+                }
+
+                applyAction?.Invoke(request, requestLookup, scene);
+                HydrateSceneReferences(request, requestLookup, scene, scenePath);
+
+                var saved = UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene);
+                UnityEditor.SceneManagement.EditorSceneManager.CloseScene(scene, true);
+                if (!saved)
+                {
+                    error = "Failed to save scene asset.";
+                }
+            }).ConfigureAwait(false);
+
+            if (!string.IsNullOrWhiteSpace(error))
+            {
+                request.notes = AppendNote(request.notes, error);
+                return false;
+            }
+
+            return true;
         }
 
         private async Task<bool> ApplyAssetFallbackAsync(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup)
@@ -1764,9 +4487,9 @@ namespace ProtoTipAI.Editor
             }
         }
 
-        private static async Task<string> RequestSceneNotesAsync(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup, string token, string model, CancellationToken cancellationToken)
+        private static async Task<string> RequestSceneNotesAsync(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup, ProtoProviderSnapshot settings, CancellationToken cancellationToken)
         {
-            if (request == null || string.IsNullOrWhiteSpace(token))
+            if (request == null || settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
             {
                 return string.Empty;
             }
@@ -1810,7 +4533,7 @@ namespace ProtoTipAI.Editor
                 new ProtoChatMessage
                 {
                     role = "system",
-                    content = "You create scene notes for Unity. Return ONLY a short text block with lines like: \"prefabs: A, B\" and \"managers: X, Y\" and optionally include \"ui\" and/or \"spawn\"."
+                    content = ProtoPrompts.SceneNotesSystemInstruction
                 }
             };
 
@@ -1819,10 +4542,10 @@ namespace ProtoTipAI.Editor
             messages.Add(new ProtoChatMessage
             {
                 role = "user",
-                content = $"Scene request: {request.name}\nAvailable prefabs: {prefabsList}\nAvailable manager-like scripts: {managersList}\nChoose the minimal set needed for a functional scene."
+                content = string.Format(ProtoPrompts.SceneNotesUserPromptFormat, request.name, prefabsList, managersList)
             });
 
-            return await ProtoOpenAIClient.SendChatAsync(token, model, messages.ToArray(), 320, cancellationToken).ConfigureAwait(false);
+            return await ProtoProviderClient.SendChatAsync(settings, messages.ToArray(), 320, cancellationToken).ConfigureAwait(false);
         }
 
         private static bool TryCreateSceneForRequest(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup, out string error)
@@ -1865,8 +4588,16 @@ namespace ProtoTipAI.Editor
                 UnityEditor.SceneManagement.NewSceneMode.Additive);
 
             AddDefaultSceneContent(request, newScene);
-            AddScenePrefabs(request, requestLookup, newScene);
-            AddSceneManagers(request, requestLookup, newScene);
+            var hasScenePrefabSteps = HasSceneDetailRequests(request, requestLookup, "scene_prefab");
+            var hasSceneManagerSteps = HasSceneDetailRequests(request, requestLookup, "scene_manager");
+            if (!hasScenePrefabSteps)
+            {
+                AddScenePrefabs(request, requestLookup, newScene);
+            }
+            if (!hasSceneManagerSteps)
+            {
+                AddSceneManagers(request, requestLookup, newScene);
+            }
             AddSceneUi(request, requestLookup, newScene);
             AddSceneSpawnPoints(request, newScene);
             HydrateSceneReferences(request, requestLookup, newScene, scenePath);
@@ -1901,8 +4632,16 @@ namespace ProtoTipAI.Editor
             }
 
             AddDefaultSceneContent(request, scene);
-            AddScenePrefabs(request, requestLookup, scene);
-            AddSceneManagers(request, requestLookup, scene);
+            var hasScenePrefabSteps = HasSceneDetailRequests(request, requestLookup, "scene_prefab");
+            var hasSceneManagerSteps = HasSceneDetailRequests(request, requestLookup, "scene_manager");
+            if (!hasScenePrefabSteps)
+            {
+                AddScenePrefabs(request, requestLookup, scene);
+            }
+            if (!hasSceneManagerSteps)
+            {
+                AddSceneManagers(request, requestLookup, scene);
+            }
             AddSceneUi(request, requestLookup, scene);
             AddSceneSpawnPoints(request, scene);
             HydrateSceneReferences(request, requestLookup, scene, scenePath);
@@ -1919,9 +4658,9 @@ namespace ProtoTipAI.Editor
             return true;
         }
 
-        private static void EnqueueSceneLayout(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup, string token, string model, string scenePath)
+        private static void EnqueueSceneLayout(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup, ProtoProviderSnapshot settings, string scenePath)
         {
-            if (request == null || string.IsNullOrWhiteSpace(scenePath))
+            if (request == null || string.IsNullOrWhiteSpace(scenePath) || settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
             {
                 return;
             }
@@ -1935,8 +4674,7 @@ namespace ProtoTipAI.Editor
             SceneLayoutQueue.Enqueue(new SceneLayoutJob
             {
                 scenePath = scenePath,
-                token = token,
-                model = model,
+                settings = settings,
                 targets = targets.ToArray(),
                 notes = request.notes ?? string.Empty
             });
@@ -2000,16 +4738,21 @@ namespace ProtoTipAI.Editor
                 new ProtoChatMessage
                 {
                     role = "system",
-                    content = "You are arranging a Unity scene layout. Return ONLY JSON: {\"items\":[{\"name\":\"GameObjectName\",\"position\":[x,y,z],\"rotation\":[x,y,z],\"scale\":[x,y,z]}]}."
+                    content = ProtoPrompts.SceneLayoutSystemInstruction
                 },
                 new ProtoChatMessage
                 {
                     role = "user",
-                    content = $"Scene targets: {list}.\nNotes: {notes}\nUse world positions. Keep UI and EventSystem at (0,0,0)."
+                    content = string.Format(ProtoPrompts.SceneLayoutUserPromptFormat, list, notes)
                 }
             };
 
-            return await ProtoOpenAIClient.SendChatAsync(job.token, job.model, messages.ToArray(), 320).ConfigureAwait(false);
+            if (job.settings == null || string.IsNullOrWhiteSpace(job.settings.ApiKey))
+            {
+                return string.Empty;
+            }
+
+            return await ProtoProviderClient.SendChatAsync(job.settings, messages.ToArray(), 320).ConfigureAwait(false);
         }
 
         private static Task ApplySceneLayoutAsync(string scenePath, SceneLayoutResponse layout)
@@ -2232,8 +4975,7 @@ namespace ProtoTipAI.Editor
         private sealed class SceneLayoutJob
         {
             public string scenePath;
-            public string token;
-            public string model;
+            public ProtoProviderSnapshot settings;
             public string[] targets;
             public string notes;
         }
@@ -2420,6 +5162,96 @@ namespace ProtoTipAI.Editor
 
             folderPath = normalized;
             return $"{normalized}/{sceneName}.unity";
+        }
+
+        private static string ResolvePrefabPathForComponentRequest(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup)
+        {
+            if (request == null)
+            {
+                return string.Empty;
+            }
+
+            if (!string.IsNullOrWhiteSpace(request.path))
+            {
+                var normalized = EnsureProjectPath(request.path.Trim());
+                if (normalized.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
+                {
+                    return normalized;
+                }
+            }
+
+            if (requestLookup != null && request.dependsOn != null)
+            {
+                foreach (var depId in request.dependsOn)
+                {
+                    if (string.IsNullOrWhiteSpace(depId))
+                    {
+                        continue;
+                    }
+
+                    if (!requestLookup.TryGetValue(depId, out var depRequest) || depRequest == null)
+                    {
+                        continue;
+                    }
+
+                    var isPrefab = string.Equals(depRequest.type, "prefab", StringComparison.OrdinalIgnoreCase) ||
+                                   (string.Equals(depRequest.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikePrefabRequest(depRequest));
+                    if (!isPrefab)
+                    {
+                        continue;
+                    }
+
+                    var prefabName = GetPrefabName(depRequest);
+                    return BuildPrefabPath(depRequest.path, prefabName, out _);
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private static string ResolveScenePathForDetailRequest(ProtoFeatureRequest request, Dictionary<string, ProtoFeatureRequest> requestLookup)
+        {
+            if (request == null)
+            {
+                return string.Empty;
+            }
+
+            if (!string.IsNullOrWhiteSpace(request.path))
+            {
+                var normalized = EnsureProjectPath(request.path.Trim());
+                if (normalized.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                {
+                    return normalized;
+                }
+            }
+
+            if (requestLookup != null && request.dependsOn != null)
+            {
+                foreach (var depId in request.dependsOn)
+                {
+                    if (string.IsNullOrWhiteSpace(depId))
+                    {
+                        continue;
+                    }
+
+                    if (!requestLookup.TryGetValue(depId, out var depRequest) || depRequest == null)
+                    {
+                        continue;
+                    }
+
+                    var isScene = string.Equals(depRequest.type, "scene", StringComparison.OrdinalIgnoreCase) ||
+                                  (string.Equals(depRequest.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikeSceneRequest(depRequest));
+                    if (!isScene)
+                    {
+                        continue;
+                    }
+
+                    var sceneName = GetSceneName(depRequest);
+                    return BuildScenePath(depRequest.path, sceneName, out _);
+                }
+            }
+
+            return string.Empty;
         }
 
         private static string BuildMaterialPath(string path, string name, out string folderPath)
@@ -2913,7 +5745,7 @@ namespace ProtoTipAI.Editor
             return AssetFallbackKind.Unknown;
         }
 
-        private async Task<bool> GenerateScriptForRequestAsync(ProtoFeatureRequest request, string token, string model, ProtoChatMessage[] baseMessages, Dictionary<string, ProtoFeatureRequest> requestLookup, CancellationToken cancellationToken)
+        private async Task<bool> GenerateScriptForRequestAsync(ProtoFeatureRequest request, ProtoProviderSnapshot settings, ProtoChatMessage[] baseMessages, Dictionary<string, ProtoFeatureRequest> requestLookup, CancellationToken cancellationToken)
         {
             NormalizeScriptRequestName(request, true);
             if (string.IsNullOrWhiteSpace(request.name))
@@ -2926,7 +5758,7 @@ namespace ProtoTipAI.Editor
                 cancellationToken.ThrowIfCancellationRequested();
                 var targetFolder = NormalizeFolderPath(request.path);
                 var scriptPrompt = string.IsNullOrWhiteSpace(request.notes)
-                    ? $"Create a MonoBehaviour named {request.name}."
+                    ? string.Format(ProtoPrompts.ScriptDefaultPromptFormat, request.name)
                     : request.notes.Trim();
 
                 var messages = new List<ProtoChatMessage>(baseMessages ?? Array.Empty<ProtoChatMessage>());
@@ -2941,8 +5773,13 @@ namespace ProtoTipAI.Editor
                 }
                 messages.Add(new ProtoChatMessage
                 {
+                    role = "system",
+                    content = ProtoPrompts.ScriptGenerationSystemInstruction
+                });
+                messages.Add(new ProtoChatMessage
+                {
                     role = "user",
-                    content = $"Generate a Unity C# MonoBehaviour. Output only code. Class name: {request.name}."
+                    content = string.Format(ProtoPrompts.ScriptGenerationUserInstructionFormat, request.name)
                 });
                 messages.Add(new ProtoChatMessage
                 {
@@ -2952,7 +5789,7 @@ namespace ProtoTipAI.Editor
 
                 _apiWaitTimeoutSeconds = 320;
                 await RunOnMainThread(() => BeginApiWait($"script {request.name}")).ConfigureAwait(false);
-                var response = await ProtoOpenAIClient.SendChatAsync(token, model, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
+                var response = await ProtoProviderClient.SendChatAsync(settings, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
                 var code = ExtractCode(response);
 
                 var writeError = string.Empty;
@@ -2984,6 +5821,11 @@ namespace ProtoTipAI.Editor
             var ordered = OrderRequests(featureRequests);
             var settings = await RunOnMainThread(GetSettingsSnapshot).ConfigureAwait(false);
             var baseMessages = await RunOnMainThread(() => BuildBaseContextMessages(true).ToArray()).ConfigureAwait(false);
+            var total = ordered.Count;
+            if (total > 0)
+            {
+                await RunOnMainThread(() => SetOperationProgress("Executing requests", 0, total)).ConfigureAwait(false);
+            }
 
             for (var i = 0; i < ordered.Count; i++)
             {
@@ -2994,14 +5836,19 @@ namespace ProtoTipAI.Editor
                     continue;
                 }
 
-                if (string.Equals(request.status, "done", StringComparison.OrdinalIgnoreCase))
+                if (total > 0)
+                {
+                    await RunOnMainThread(() => SetOperationProgress("Executing requests", i + 1, total)).ConfigureAwait(false);
+                }
+
+                if (request.HasStatus(ProtoAgentRequestStatus.Done))
                 {
                     continue;
                 }
 
                 await RunOnMainThread(() =>
                 {
-                    request.status = "in_progress";
+                    request.SetStatus(ProtoAgentRequestStatus.InProgress);
                     request.updatedAt = DateTime.UtcNow.ToString("o");
                     ProtoFeatureRequestStore.SaveRequest(request);
                 }).ConfigureAwait(false);
@@ -3012,7 +5859,7 @@ namespace ProtoTipAI.Editor
                 var succeeded = false;
                 try
                 {
-                    succeeded = await ApplyRequestAsync(request, settings.token, settings.model, baseMessages, requestLookup, cancellationToken).ConfigureAwait(false);
+                    succeeded = await ApplyRequestAsync(request, settings, baseMessages, requestLookup, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -3022,7 +5869,7 @@ namespace ProtoTipAI.Editor
 
                 await RunOnMainThread(() =>
                 {
-                    request.status = succeeded ? "done" : "blocked";
+                    request.SetStatus(succeeded ? ProtoAgentRequestStatus.Done : ProtoAgentRequestStatus.Blocked);
                     request.updatedAt = DateTime.UtcNow.ToString("o");
                     ProtoFeatureRequestStore.SaveRequest(request);
                 }).ConfigureAwait(false);
@@ -3034,7 +5881,7 @@ namespace ProtoTipAI.Editor
             var blocked = new List<ProtoFeatureRequest>();
             foreach (var request in featureRequests)
             {
-                if (request != null && string.Equals(request.status, "blocked", StringComparison.OrdinalIgnoreCase))
+                if (request != null && request.HasStatus(ProtoAgentRequestStatus.Blocked))
                 {
                     blocked.Add(request);
                 }
@@ -3069,6 +5916,38 @@ namespace ProtoTipAI.Editor
                 }
             }
 
+            var prefabsWithDetailRequests = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var request in featureRequests)
+            {
+                if (request == null || !string.Equals(request.type, "prefab_component", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (request.dependsOn == null)
+                {
+                    continue;
+                }
+
+                foreach (var depId in request.dependsOn)
+                {
+                    if (string.IsNullOrWhiteSpace(depId))
+                    {
+                        continue;
+                    }
+
+                    if (requestById.TryGetValue(depId, out var depRequest) &&
+                        (string.Equals(depRequest.type, "prefab", StringComparison.OrdinalIgnoreCase) ||
+                         (string.Equals(depRequest.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikePrefabRequest(depRequest))))
+                    {
+                        if (!string.IsNullOrWhiteSpace(depRequest.id))
+                        {
+                            prefabsWithDetailRequests.Add(depRequest.id);
+                        }
+                    }
+                }
+            }
+
             var plans = new List<PrefabAttachmentPlan>();
             foreach (var request in featureRequests)
             {
@@ -3079,6 +5958,11 @@ namespace ProtoTipAI.Editor
 
                 if (!string.Equals(request.type, "prefab", StringComparison.OrdinalIgnoreCase) &&
                     !(string.Equals(request.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikePrefabRequest(request)))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(request.id) && prefabsWithDetailRequests.Contains(request.id))
                 {
                     continue;
                 }
@@ -3212,7 +6096,15 @@ namespace ProtoTipAI.Editor
                 }
 
                 var type = FindTypeByName(name.Trim());
-                if (type == null)
+                if (!IsValidComponentType(type))
+                {
+                    if (type != null && TryResolveAbstractComponentFallback(type, name, out var fallbackName))
+                    {
+                        type = FindTypeByName(fallbackName);
+                    }
+                }
+
+                if (!IsValidComponentType(type))
                 {
                     missing.Add(name.Trim());
                     continue;
@@ -3355,6 +6247,450 @@ namespace ProtoTipAI.Editor
                     }
                 }
             }
+        }
+
+        private static Dictionary<string, bool> ExtractComponentPropertyFlags(string text)
+        {
+            var flags = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return flags;
+            }
+
+            foreach (Match match in Regex.Matches(text, @"\((?<inner>[^)]+)\)"))
+            {
+                var inner = match.Groups["inner"].Value;
+                if (string.IsNullOrWhiteSpace(inner))
+                {
+                    continue;
+                }
+
+                foreach (var entry in inner.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var token = entry.Trim();
+                    if (string.IsNullOrWhiteSpace(token))
+                    {
+                        continue;
+                    }
+
+                    var name = token;
+                    var value = true;
+                    var separatorIndex = token.IndexOf('=');
+                    if (separatorIndex < 0)
+                    {
+                        separatorIndex = token.IndexOf(':');
+                    }
+
+                    if (separatorIndex >= 0)
+                    {
+                        name = token.Substring(0, separatorIndex).Trim();
+                        var valueText = token.Substring(separatorIndex + 1).Trim();
+                        if (!string.IsNullOrWhiteSpace(valueText))
+                        {
+                            if (bool.TryParse(valueText, out var boolValue))
+                            {
+                                value = boolValue;
+                            }
+                            else if (string.Equals(valueText, "1", StringComparison.OrdinalIgnoreCase))
+                            {
+                                value = true;
+                            }
+                            else if (string.Equals(valueText, "0", StringComparison.OrdinalIgnoreCase))
+                            {
+                                value = false;
+                            }
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        flags[name] = value;
+                    }
+                }
+            }
+
+            return flags;
+        }
+
+        private static string ApplyPrefabComponentPropertyFlags(
+            string prefabPath,
+            List<string> componentNames,
+            Dictionary<string, bool> propertyFlags)
+        {
+            if (string.IsNullOrWhiteSpace(prefabPath) || propertyFlags == null || propertyFlags.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var root = PrefabUtility.LoadPrefabContents(prefabPath);
+            if (root == null)
+            {
+                return "Failed to load prefab contents for property updates.";
+            }
+
+            var pending = new HashSet<string>(propertyFlags.Keys, StringComparer.OrdinalIgnoreCase);
+            var appliedAny = false;
+            if (componentNames != null)
+            {
+                foreach (var componentName in componentNames)
+                {
+                    if (string.IsNullOrWhiteSpace(componentName))
+                    {
+                        continue;
+                    }
+
+                    var type = FindTypeByName(componentName);
+                    if (type == null || !typeof(Component).IsAssignableFrom(type))
+                    {
+                        continue;
+                    }
+
+                    var component = root.GetComponent(type);
+                    if (component == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var flag in propertyFlags)
+                    {
+                        if (TrySetComponentBoolProperty(component, flag.Key, flag.Value))
+                        {
+                            appliedAny = true;
+                            pending.Remove(flag.Key);
+                        }
+                    }
+                }
+            }
+
+            PrefabUtility.SaveAsPrefabAsset(root, prefabPath);
+            PrefabUtility.UnloadPrefabContents(root);
+
+            if (!appliedAny)
+            {
+                return "Prefab component flags were not applied.";
+            }
+
+            if (pending.Count > 0)
+            {
+                return $"Prefab component flags not found: {string.Join(", ", pending)}.";
+            }
+
+            return string.Empty;
+        }
+
+        private static bool TrySetComponentBoolProperty(Component component, string propertyName, bool value)
+        {
+            if (component == null || string.IsNullOrWhiteSpace(propertyName))
+            {
+                return false;
+            }
+
+            var type = component.GetType();
+            var properties = type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            foreach (var property in properties)
+            {
+                if (!string.Equals(property.Name, propertyName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (!property.CanWrite || property.PropertyType != typeof(bool))
+                {
+                    continue;
+                }
+
+                property.SetValue(component, value);
+                return true;
+            }
+
+            var fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            foreach (var field in fields)
+            {
+                if (!string.Equals(field.Name, propertyName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (field.FieldType != typeof(bool))
+                {
+                    continue;
+                }
+
+                field.SetValue(component, value);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static List<string> ResolveComponentNamesForRequest(ProtoFeatureRequest request, List<string> unresolvedNames)
+        {
+            var results = new List<string>();
+            var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (request == null)
+            {
+                return results;
+            }
+
+            var rawName = request.name;
+            if (!string.IsNullOrWhiteSpace(rawName))
+            {
+                foreach (var candidate in EnumerateComponentCandidates(rawName))
+                {
+                    if (TryResolveComponentTypeName(candidate, out var typeName))
+                    {
+                        if (unique.Add(typeName))
+                        {
+                            results.Add(typeName);
+                        }
+                    }
+                    else if (LooksLikeIdentifierCandidate(candidate))
+                    {
+                        unresolvedNames?.Add(candidate.Trim());
+                    }
+                }
+            }
+
+            foreach (var candidate in ParseComponentNamesFromNotes(request.notes))
+            {
+                if (TryResolveComponentTypeName(candidate, out var typeName))
+                {
+                    if (unique.Add(typeName))
+                    {
+                        results.Add(typeName);
+                    }
+                }
+                else if (LooksLikeIdentifierCandidate(candidate))
+                {
+                    unresolvedNames?.Add(candidate.Trim());
+                }
+            }
+
+            if (results.Count == 0 && !string.IsNullOrWhiteSpace(rawName))
+            {
+                var trimmed = rawName.Trim();
+                if (IdentifierRegex.IsMatch(trimmed) && unique.Add(trimmed))
+                {
+                    results.Add(trimmed);
+                }
+            }
+
+            return results;
+        }
+
+        private static IEnumerable<string> EnumerateComponentCandidates(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                yield break;
+            }
+
+            var split = text.Split(new[] { '\n', '\r', ',', ';', '|', '/' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var entry in split)
+            {
+                var trimmed = entry.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed))
+                {
+                    continue;
+                }
+
+                var parenIndex = trimmed.IndexOf('(');
+                if (parenIndex > 0)
+                {
+                    var baseName = trimmed.Substring(0, parenIndex).Trim();
+                    if (!string.IsNullOrWhiteSpace(baseName))
+                    {
+                        yield return baseName;
+                    }
+                }
+
+                if (trimmed.Contains(". "))
+                {
+                    var subparts = trimmed.Split(new[] { ". " }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var sub in subparts)
+                    {
+                        var cleaned = sub.Trim().Trim('.', ':');
+                        if (!string.IsNullOrWhiteSpace(cleaned))
+                        {
+                            yield return cleaned;
+                        }
+                    }
+                }
+                else
+                {
+                    yield return trimmed.Trim('.', ':');
+                }
+            }
+        }
+
+        private static bool TryResolveComponentTypeName(string candidate, out string typeName)
+        {
+            typeName = null;
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                return false;
+            }
+
+            foreach (var variant in BuildComponentNameVariants(candidate))
+            {
+                var type = FindTypeByName(variant);
+                if (type != null)
+                {
+                    if (IsValidComponentType(type))
+                    {
+                        typeName = type.Name;
+                        return true;
+                    }
+
+                    if (TryResolveAbstractComponentFallback(type, variant, out var fallback))
+                    {
+                        typeName = fallback;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsValidComponentType(Type type)
+        {
+            return type != null && typeof(Component).IsAssignableFrom(type) && !type.IsAbstract;
+        }
+
+        private static bool TryResolveAbstractComponentFallback(Type type, string candidate, out string fallbackName)
+        {
+            fallbackName = null;
+            if (type == null)
+            {
+                return false;
+            }
+
+            var typeName = type.Name;
+            if (string.Equals(typeName, "Collider", StringComparison.OrdinalIgnoreCase))
+            {
+                fallbackName = "BoxCollider";
+                return true;
+            }
+
+            if (string.Equals(typeName, "Collider2D", StringComparison.OrdinalIgnoreCase))
+            {
+                fallbackName = "BoxCollider2D";
+                return true;
+            }
+
+            if (string.Equals(typeName, "Renderer", StringComparison.OrdinalIgnoreCase))
+            {
+                fallbackName = "MeshRenderer";
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(candidate) &&
+                candidate.IndexOf("2d", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                if (string.Equals(typeName, "Rigidbody", StringComparison.OrdinalIgnoreCase))
+                {
+                    fallbackName = "Rigidbody2D";
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<string> BuildComponentNameVariants(string candidate)
+        {
+            var results = new List<string>();
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                return results;
+            }
+
+            void AddVariant(string value)
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    return;
+                }
+
+                var trimmed = value.Trim();
+                if (results.Exists(existing => string.Equals(existing, trimmed, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return;
+                }
+                results.Add(trimmed);
+            }
+
+            var trimmedCandidate = candidate.Trim().Trim('.', ':');
+            AddVariant(trimmedCandidate);
+
+            if (trimmedCandidate.Contains(".") && trimmedCandidate.IndexOf(' ') < 0)
+            {
+                var lastDot = trimmedCandidate.LastIndexOf('.');
+                if (lastDot >= 0 && lastDot < trimmedCandidate.Length - 1)
+                {
+                    AddVariant(trimmedCandidate.Substring(lastDot + 1));
+                }
+            }
+
+            var cleaned = Regex.Replace(trimmedCandidate, @"[^A-Za-z0-9_\. ]", " ").Trim();
+            AddVariant(cleaned);
+
+            var pascal = ToPascalCase(cleaned);
+            AddVariant(pascal);
+
+            var collapsed = Regex.Replace(cleaned, @"\s+", string.Empty);
+            AddVariant(collapsed);
+
+            return results;
+        }
+
+        private static string ToPascalCase(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            var parts = Regex.Split(value, @"[^A-Za-z0-9_]+");
+            var builder = new StringBuilder();
+            foreach (var part in parts)
+            {
+                if (string.IsNullOrWhiteSpace(part))
+                {
+                    continue;
+                }
+
+                var cleaned = part.Trim('_');
+                if (string.IsNullOrWhiteSpace(cleaned))
+                {
+                    continue;
+                }
+
+                builder.Append(char.ToUpperInvariant(cleaned[0]));
+                if (cleaned.Length > 1)
+                {
+                    builder.Append(cleaned.Substring(1));
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private static bool LooksLikeIdentifierCandidate(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            var trimmed = value.Trim().Trim('.', ':');
+            if (IdentifierRegex.IsMatch(trimmed))
+            {
+                return true;
+            }
+
+            return Regex.IsMatch(trimmed, @"^[A-Za-z][A-Za-z0-9_ ]+$");
         }
 
         private static Type FindTypeByName(string typeName)
@@ -4882,6 +8218,37 @@ namespace ProtoTipAI.Editor
             return results;
         }
 
+        private static bool HasSceneDetailRequests(ProtoFeatureRequest sceneRequest, Dictionary<string, ProtoFeatureRequest> requestLookup, string detailType)
+        {
+            if (sceneRequest == null || string.IsNullOrWhiteSpace(sceneRequest.id) || requestLookup == null)
+            {
+                return false;
+            }
+
+            foreach (var request in requestLookup.Values)
+            {
+                if (request == null || !string.Equals(request.type, detailType, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (request.dependsOn == null)
+                {
+                    continue;
+                }
+
+                foreach (var depId in request.dependsOn)
+                {
+                    if (string.Equals(depId, sceneRequest.id, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         private static IEnumerable<string> ParseScenePrefabNamesFromNotes(string notes)
         {
             if (string.IsNullOrWhiteSpace(notes))
@@ -5168,18 +8535,20 @@ namespace ProtoTipAI.Editor
             }
 
             var builder = new StringBuilder(2048);
-            builder.AppendLine("Use only the public members listed below when calling other scripts. Do not invent method or field names.");
-            builder.AppendLine("If you need new API, add it in your own script or avoid calling it.");
+            builder.AppendLine(ProtoPrompts.ContractContextHeader);
+            builder.AppendLine(ProtoPrompts.ContractContextApiInstruction);
+            builder.AppendLine(ProtoPrompts.ContractContextNestedTypeInstruction);
+            builder.AppendLine(ProtoPrompts.ContractContextEnumInstruction);
 
             if (!string.IsNullOrWhiteSpace(dependencySummary))
             {
-                builder.AppendLine("Dependency API:");
+                builder.AppendLine(ProtoPrompts.ContractContextDependencyHeader);
                 builder.AppendLine(dependencySummary);
             }
 
             if (!string.IsNullOrWhiteSpace(indexSummary))
             {
-                builder.AppendLine("Project API (subset):");
+                builder.AppendLine(ProtoPrompts.ContractContextProjectHeader);
                 builder.AppendLine(indexSummary);
             }
 
@@ -5258,7 +8627,8 @@ namespace ProtoTipAI.Editor
                     break;
                 }
 
-                builder.AppendLine($"- {entry.DisplayName} ({entry.path})");
+                var kindLabel = string.IsNullOrWhiteSpace(entry.kind) ? string.Empty : $"{entry.kind} ";
+                builder.AppendLine($"- {kindLabel}{entry.DisplayName} ({entry.path})");
                 var memberCount = 0;
                 foreach (var member in entry.members)
                 {
@@ -5617,6 +8987,282 @@ namespace ProtoTipAI.Editor
             return string.Empty;
         }
 
+        private struct MissingMemberInfo
+        {
+            public string typeName;
+            public string memberName;
+        }
+
+        private static MissingMemberInfo ExtractMissingMemberInfo(string message)
+        {
+            var result = new MissingMemberInfo();
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                return result;
+            }
+
+            var match = Regex.Match(message, @"'([^']+)'\s+does not contain a definition for\s+'([^']+)'", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                match = Regex.Match(message, @"`([^`]+)`\s+does not contain a definition for\s+`([^`]+)`", RegexOptions.IgnoreCase);
+            }
+
+            if (match.Success)
+            {
+                result.typeName = match.Groups[1].Value.Trim();
+                result.memberName = match.Groups[2].Value.Trim();
+            }
+
+            return result;
+        }
+
+        private static string ExtractMissingSymbolName(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                return string.Empty;
+            }
+
+            var match = Regex.Match(message, @"The name '([^']+)' does not exist in the current context", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                match = Regex.Match(message, @"The name `([^`]+)` does not exist", RegexOptions.IgnoreCase);
+            }
+
+            return match.Success ? match.Groups[1].Value.Trim() : string.Empty;
+        }
+
+        private string BuildFixPassContext(ConsoleErrorItem error)
+        {
+            var index = GetScriptContractIndex();
+            return BuildFixContext(error, index);
+        }
+
+        private static string BuildFixContext(ConsoleErrorItem error, ScriptContractIndex index)
+        {
+            if (index == null || string.IsNullOrWhiteSpace(error.message))
+            {
+                return string.Empty;
+            }
+
+            var builder = new StringBuilder(512);
+            var usedEntries = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            var missingType = ExtractMissingTypeName(error.message);
+            if (!string.IsNullOrWhiteSpace(missingType))
+            {
+                var matches = FindContractEntriesByTypeName(index, missingType, 3);
+                if (matches.Count > 0)
+                {
+                    builder.AppendLine($"Type lookup for '{missingType}':");
+                    foreach (var entry in matches)
+                    {
+                        AppendContractEntrySummary(builder, entry, usedEntries, null);
+                    }
+                }
+                else
+                {
+                    builder.AppendLine($"Type lookup for '{missingType}': not found in project scripts.");
+                }
+            }
+
+            var missingMember = ExtractMissingMemberInfo(error.message);
+            if (!string.IsNullOrWhiteSpace(missingMember.memberName))
+            {
+                var memberLabel = string.IsNullOrWhiteSpace(missingMember.typeName)
+                    ? $"Member lookup for '{missingMember.memberName}':"
+                    : $"Member lookup for '{missingMember.typeName}.{missingMember.memberName}':";
+                builder.AppendLine(memberLabel);
+
+                if (!string.IsNullOrWhiteSpace(missingMember.typeName))
+                {
+                    var matches = FindContractEntriesByTypeName(index, missingMember.typeName, 2);
+                    if (matches.Count == 0)
+                    {
+                        builder.AppendLine($"- No type match for '{missingMember.typeName}'.");
+                    }
+                    foreach (var entry in matches)
+                    {
+                        AppendContractEntrySummary(builder, entry, usedEntries, missingMember.memberName);
+                    }
+                }
+                else
+                {
+                    var matches = FindEntriesWithMemberName(index, missingMember.memberName, 3);
+                    if (matches.Count == 0)
+                    {
+                        builder.AppendLine($"- No member matches for '{missingMember.memberName}'.");
+                    }
+                    foreach (var entry in matches)
+                    {
+                        AppendContractEntrySummary(builder, entry, usedEntries, missingMember.memberName);
+                    }
+                }
+            }
+
+            var missingSymbol = ExtractMissingSymbolName(error.message);
+            if (!string.IsNullOrWhiteSpace(missingSymbol) &&
+                !string.Equals(missingSymbol, missingMember.memberName, StringComparison.OrdinalIgnoreCase))
+            {
+                builder.AppendLine($"Symbol lookup for '{missingSymbol}':");
+                var memberMatches = FindEntriesWithMemberName(index, missingSymbol, 3);
+                if (memberMatches.Count == 0)
+                {
+                    var typeMatches = FindContractEntriesByTypeName(index, missingSymbol, 2);
+                    if (typeMatches.Count == 0)
+                    {
+                        builder.AppendLine("- No matches in project scripts.");
+                    }
+                    foreach (var entry in typeMatches)
+                    {
+                        AppendContractEntrySummary(builder, entry, usedEntries, null);
+                    }
+                }
+                else
+                {
+                    foreach (var entry in memberMatches)
+                    {
+                        AppendContractEntrySummary(builder, entry, usedEntries, missingSymbol);
+                    }
+                }
+            }
+
+            return builder.ToString().Trim();
+        }
+
+        private static List<ScriptContractEntry> FindContractEntriesByTypeName(ScriptContractIndex index, string typeName, int maxResults)
+        {
+            var results = new List<ScriptContractEntry>();
+            if (index == null || string.IsNullOrWhiteSpace(typeName) || maxResults <= 0)
+            {
+                return results;
+            }
+
+            var trimmed = typeName.Trim();
+            foreach (var entry in index.entries)
+            {
+                if (results.Count >= maxResults)
+                {
+                    break;
+                }
+
+                if (!string.IsNullOrWhiteSpace(entry.fullName) &&
+                    string.Equals(entry.fullName, trimmed, StringComparison.OrdinalIgnoreCase))
+                {
+                    results.Add(entry);
+                }
+            }
+
+            var simpleName = trimmed;
+            var lastDot = trimmed.LastIndexOf('.');
+            if (lastDot >= 0 && lastDot < trimmed.Length - 1)
+            {
+                simpleName = trimmed.Substring(lastDot + 1);
+            }
+
+            if (!string.IsNullOrWhiteSpace(simpleName))
+            {
+                foreach (var entry in index.entries)
+                {
+                    if (results.Count >= maxResults)
+                    {
+                        break;
+                    }
+
+                    if (string.Equals(entry.name, simpleName, StringComparison.OrdinalIgnoreCase) && !results.Contains(entry))
+                    {
+                        results.Add(entry);
+                    }
+                }
+            }
+
+            return results;
+        }
+
+        private static List<ScriptContractEntry> FindEntriesWithMemberName(ScriptContractIndex index, string memberName, int maxResults)
+        {
+            var results = new List<ScriptContractEntry>();
+            if (index == null || string.IsNullOrWhiteSpace(memberName) || maxResults <= 0)
+            {
+                return results;
+            }
+
+            foreach (var entry in index.entries)
+            {
+                if (entry == null || entry.members.Count == 0)
+                {
+                    continue;
+                }
+
+                foreach (var member in entry.members)
+                {
+                    if (member.IndexOf(memberName, StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+
+                    results.Add(entry);
+                    break;
+                }
+
+                if (results.Count >= maxResults)
+                {
+                    break;
+                }
+            }
+
+            return results;
+        }
+
+        private static void AppendContractEntrySummary(
+            StringBuilder builder,
+            ScriptContractEntry entry,
+            HashSet<string> usedEntries,
+            string memberFilter)
+        {
+            if (builder == null || entry == null)
+            {
+                return;
+            }
+
+            var key = $"{entry.DisplayName}:{entry.path}";
+            if (usedEntries != null && usedEntries.Contains(key))
+            {
+                return;
+            }
+
+            usedEntries?.Add(key);
+            builder.AppendLine($"- {entry.DisplayName} ({entry.path})");
+
+            if (entry.members.Count == 0)
+            {
+                return;
+            }
+
+            var filtered = new List<string>();
+            foreach (var member in entry.members)
+            {
+                if (string.IsNullOrWhiteSpace(memberFilter) ||
+                    member.IndexOf(memberFilter, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    filtered.Add(member);
+                }
+            }
+
+            var source = filtered.Count > 0 ? filtered : entry.members;
+            var count = 0;
+            foreach (var member in source)
+            {
+                if (count >= MaxMembersPerScript)
+                {
+                    break;
+                }
+
+                builder.AppendLine($"  - {member}");
+                count++;
+            }
+        }
+
         private static bool ScriptIndexContainsType(string scriptIndex, string typeName)
         {
             if (string.IsNullOrWhiteSpace(scriptIndex) || string.IsNullOrWhiteSpace(typeName))
@@ -5624,7 +9270,10 @@ namespace ProtoTipAI.Editor
                 return false;
             }
 
-            var pattern = $@"^-\s+.*\b{Regex.Escape(typeName)}\b.*\(";
+            var escaped = Regex.Escape(typeName);
+            var pattern = typeName.IndexOfAny(new[] { '.', '+' }) >= 0
+                ? $@"^-\s+.*{escaped}.*\("
+                : $@"^-\s+.*\b{escaped}\b.*\(";
             return Regex.IsMatch(scriptIndex, pattern, RegexOptions.IgnoreCase | RegexOptions.Multiline);
         }
 
@@ -6210,7 +9859,9 @@ namespace ProtoTipAI.Editor
             }
 
             var currentNamespace = string.Empty;
-            ScriptContractEntry currentEntry = null;
+            var typeStack = new Stack<TypeScope>();
+            ScriptContractEntry pendingEntry = null;
+            var braceDepth = 0;
 
             foreach (var rawLine in File.ReadAllLines(fullPath))
             {
@@ -6222,48 +9873,137 @@ namespace ProtoTipAI.Editor
                 }
 
                 var trimmed = line.Trim();
-                if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("[", StringComparison.Ordinal))
+
+                while (typeStack.Count > 0 && braceDepth < typeStack.Peek().depth)
                 {
-                    continue;
+                    typeStack.Pop();
                 }
 
-                var namespaceMatch = NamespaceRegex.Match(trimmed);
-                if (namespaceMatch.Success)
+                var isTypeDeclaration = false;
+                if (!string.IsNullOrWhiteSpace(trimmed) && !trimmed.StartsWith("[", StringComparison.Ordinal))
                 {
-                    currentNamespace = namespaceMatch.Groups[1].Value.Trim();
-                    continue;
-                }
-
-                var typeMatch = TypeRegex.Match(trimmed);
-                if (typeMatch.Success)
-                {
-                    var typeName = typeMatch.Groups[3].Value.Trim();
-                    var entry = new ScriptContractEntry
+                    var namespaceMatch = NamespaceRegex.Match(trimmed);
+                    if (namespaceMatch.Success)
                     {
-                        name = typeName,
-                        fullName = string.IsNullOrWhiteSpace(currentNamespace) ? typeName : $"{currentNamespace}.{typeName}",
-                        path = assetPath
-                    };
-                    results.Add(entry);
-                    currentEntry = entry;
-                    continue;
+                        currentNamespace = namespaceMatch.Groups[1].Value.Trim();
+                    }
+                    else
+                    {
+                        var typeMatch = TypeRegex.Match(trimmed);
+                        if (typeMatch.Success)
+                        {
+                            isTypeDeclaration = true;
+                            var typeName = typeMatch.Groups[3].Value.Trim();
+                            var typeKind = typeMatch.Groups[2].Value.Trim();
+                            var nestedPrefix = BuildNestedTypePrefix(typeStack);
+                            var entry = new ScriptContractEntry
+                            {
+                                name = typeName,
+                                fullName = BuildFullTypeName(currentNamespace, nestedPrefix, typeName),
+                                path = assetPath,
+                                kind = typeKind
+                            };
+                            results.Add(entry);
+                            pendingEntry = entry;
+                        }
+                    }
                 }
 
-                if (currentEntry == null)
+                if (!isTypeDeclaration &&
+                    !string.IsNullOrWhiteSpace(trimmed) &&
+                    typeStack.Count > 0 &&
+                    !trimmed.StartsWith("{", StringComparison.Ordinal) &&
+                    !trimmed.StartsWith("}", StringComparison.Ordinal) &&
+                    !trimmed.StartsWith("[", StringComparison.Ordinal))
                 {
-                    continue;
+                    TryAddMember(typeStack.Peek().entry, trimmed);
                 }
 
-                TryAddMember(currentEntry, trimmed);
+                var openCount = CountChar(line, '{');
+                var closeCount = CountChar(line, '}');
+                if (pendingEntry != null && openCount > 0)
+                {
+                    typeStack.Push(new TypeScope(pendingEntry, braceDepth + 1));
+                    pendingEntry = null;
+                }
+
+                braceDepth += openCount - closeCount;
+
+                while (typeStack.Count > 0 && braceDepth < typeStack.Peek().depth)
+                {
+                    typeStack.Pop();
+                }
             }
 
             return results;
+        }
+
+        private static string BuildNestedTypePrefix(Stack<TypeScope> typeStack)
+        {
+            if (typeStack == null || typeStack.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var scopes = typeStack.ToArray();
+            var builder = new StringBuilder(128);
+            for (var i = scopes.Length - 1; i >= 0; i--)
+            {
+                if (builder.Length > 0)
+                {
+                    builder.Append('.');
+                }
+                builder.Append(scopes[i].entry.name);
+            }
+
+            return builder.ToString();
+        }
+
+        private static string BuildFullTypeName(string currentNamespace, string nestedPrefix, string typeName)
+        {
+            var fullName = typeName;
+            if (!string.IsNullOrWhiteSpace(nestedPrefix))
+            {
+                fullName = $"{nestedPrefix}.{typeName}";
+            }
+
+            if (!string.IsNullOrWhiteSpace(currentNamespace))
+            {
+                fullName = $"{currentNamespace}.{fullName}";
+            }
+
+            return fullName;
+        }
+
+        private static int CountChar(string text, char target)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return 0;
+            }
+
+            var count = 0;
+            for (var i = 0; i < text.Length; i++)
+            {
+                if (text[i] == target)
+                {
+                    count++;
+                }
+            }
+
+            return count;
         }
 
         private static void TryAddMember(ScriptContractEntry entry, string line)
         {
             if (entry == null || string.IsNullOrWhiteSpace(line))
             {
+                return;
+            }
+
+            if (entry.IsEnum)
+            {
+                TryAddEnumValue(entry, line);
                 return;
             }
 
@@ -6311,6 +10051,60 @@ namespace ProtoTipAI.Editor
             }
         }
 
+        private static void TryAddEnumValue(ScriptContractEntry entry, string line)
+        {
+            if (entry == null || string.IsNullOrWhiteSpace(line))
+            {
+                return;
+            }
+
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0)
+            {
+                return;
+            }
+
+            if (trimmed.StartsWith("[", StringComparison.Ordinal) ||
+                trimmed.StartsWith("{", StringComparison.Ordinal) ||
+                trimmed.StartsWith("}", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            var parts = trimmed.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var part in parts)
+            {
+                var token = part.Trim();
+                if (string.IsNullOrWhiteSpace(token))
+                {
+                    continue;
+                }
+
+                var equalsIndex = token.IndexOf('=');
+                if (equalsIndex >= 0)
+                {
+                    token = token.Substring(0, equalsIndex).Trim();
+                }
+
+                if (!IsValidIdentifier(token))
+                {
+                    continue;
+                }
+
+                AddMember(entry, $"value: {token}");
+            }
+        }
+
+        private static bool IsValidIdentifier(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            return IdentifierRegex.IsMatch(value);
+        }
+
         private static void AddMember(ScriptContractEntry entry, string signature)
         {
             if (entry == null || string.IsNullOrWhiteSpace(signature))
@@ -6321,6 +10115,18 @@ namespace ProtoTipAI.Editor
             if (!entry.members.Contains(signature))
             {
                 entry.members.Add(signature);
+            }
+        }
+
+        private struct TypeScope
+        {
+            public ScriptContractEntry entry;
+            public int depth;
+
+            public TypeScope(ScriptContractEntry entry, int depth)
+            {
+                this.entry = entry;
+                this.depth = depth;
             }
         }
 
@@ -6336,9 +10142,11 @@ namespace ProtoTipAI.Editor
             public string name;
             public string fullName;
             public string path;
+            public string kind;
             public readonly List<string> members = new List<string>();
 
             public string DisplayName => string.IsNullOrWhiteSpace(fullName) ? name : fullName;
+            public bool IsEnum => string.Equals(kind, "enum", StringComparison.OrdinalIgnoreCase);
         }
 
         private struct ScriptResolveResult
@@ -6369,6 +10177,21 @@ namespace ProtoTipAI.Editor
                 _operationCts = null;
             }
             _cancelRequested = false;
+            ClearOperationProgress();
+        }
+
+        private void SetOperationProgress(string label, int current, int total)
+        {
+            _operationProgressLabel = label ?? string.Empty;
+            _operationProgressCurrent = Mathf.Max(0, current);
+            _operationProgressTotal = Mathf.Max(0, total);
+        }
+
+        private void ClearOperationProgress()
+        {
+            _operationProgressLabel = string.Empty;
+            _operationProgressCurrent = 0;
+            _operationProgressTotal = 0;
         }
 
         private void RequestCancel()
@@ -6385,7 +10208,7 @@ namespace ProtoTipAI.Editor
 
         private bool IsOperationActive()
         {
-            return _isSending || _isGeneratingPlan || _isCreatingRequests || _isApplyingPlan || _isApplyingStage;
+            return _isSending || _isGeneratingPlan || _isCreatingRequests || _isApplyingPlan || _isApplyingStage || _isFixingErrors || _isAgentLoopActive;
         }
 
         private void BeginAutoRefreshBlock()
@@ -6492,6 +10315,50 @@ namespace ProtoTipAI.Editor
             }
         }
 
+        private void CheckApiWaitTimeout(bool forceClear)
+        {
+            if (!_isApiWaiting)
+            {
+                return;
+            }
+
+            var timeoutSeconds = _apiWaitTimeoutSeconds;
+            var elapsed = EditorApplication.timeSinceStartup - _apiWaitStarted;
+            var buffer = 5.0f;
+            if (!forceClear)
+            {
+                if (timeoutSeconds <= 0)
+                {
+                    return;
+                }
+
+                if (elapsed < timeoutSeconds + buffer)
+                {
+                    return;
+                }
+            }
+
+            _toolStatus = "OpenAI request timed out.";
+            if (_operationCts != null && !_operationCts.IsCancellationRequested)
+            {
+                _operationCts.Cancel();
+            }
+            ResetOperationFlags();
+            EndApiWait();
+            Repaint();
+        }
+
+        private void ResetOperationFlags()
+        {
+            _isSending = false;
+            _isGeneratingPlan = false;
+            _isCreatingRequests = false;
+            _isApplyingPlan = false;
+            _isApplyingStage = false;
+            _isFixingErrors = false;
+            _isAgentLoopActive = false;
+        }
+
         private void OnApiWaitUpdate()
         {
             if (!_isApiWaiting)
@@ -6504,6 +10371,7 @@ namespace ProtoTipAI.Editor
                 return;
             }
 
+            CheckApiWaitTimeout(false);
             Repaint();
         }
 
@@ -6547,9 +10415,9 @@ namespace ProtoTipAI.Editor
             return tcs.Task;
         }
 
-        private static (string token, string model) GetSettingsSnapshot()
+        private static ProtoProviderSnapshot GetSettingsSnapshot()
         {
-            return (ProtoOpenAISettings.GetToken(), ProtoOpenAISettings.GetModel());
+            return ProtoProviderSettings.GetSnapshot();
         }
 
         private static ProtoGenerationPlan ParsePlan(string json)
@@ -6654,9 +10522,9 @@ namespace ProtoTipAI.Editor
             return trimmed;
         }
 
-        private async Task<ProtoPhasePlan> GeneratePhasedPlanAsync(string token, string model, ProtoChatMessage[] baseMessages, string prompt, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
+        private async Task<ProtoPhasePlan> GeneratePhasedPlanAsync(ProtoProviderSnapshot settings, ProtoChatMessage[] baseMessages, string prompt, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
         {
-            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(model))
+            if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
             {
                 return null;
             }
@@ -6669,7 +10537,7 @@ namespace ProtoTipAI.Editor
             var plannedPrefabs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var plannedScenes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var plannedAssets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var phaseOutline = await RequestPhaseOutlineAsync(token, model, baseMessages, prompt, cancellationToken, currentScriptIndex, currentPrefabIndex, currentSceneIndex, currentAssetIndex).ConfigureAwait(false);
+            var phaseOutline = await RequestPhaseOutlineAsync(settings, baseMessages, prompt, cancellationToken, currentScriptIndex, currentPrefabIndex, currentSceneIndex, currentAssetIndex).ConfigureAwait(false);
             if (phaseOutline == null || phaseOutline.phases == null || phaseOutline.phases.Length == 0)
             {
                 return null;
@@ -6689,8 +10557,8 @@ namespace ProtoTipAI.Editor
                     continue;
                 }
 
-                var overview = await RequestPhaseOverviewAsync(token, model, baseMessages, prompt, outline, cancellationToken, currentScriptIndex, currentPrefabIndex, currentSceneIndex, currentAssetIndex).ConfigureAwait(false);
-                var requests = await RequestPhaseFeatureRequestsAsync(token, model, baseMessages, prompt, outline, cancellationToken, currentScriptIndex, currentPrefabIndex, currentSceneIndex, currentAssetIndex).ConfigureAwait(false);
+                var overview = await RequestPhaseOverviewAsync(settings, baseMessages, prompt, outline, cancellationToken, currentScriptIndex, currentPrefabIndex, currentSceneIndex, currentAssetIndex).ConfigureAwait(false);
+                var requests = await RequestPhaseFeatureRequestsAsync(settings, baseMessages, prompt, outline, cancellationToken, currentScriptIndex, currentPrefabIndex, currentSceneIndex, currentAssetIndex).ConfigureAwait(false);
                 NormalizePlanRequests(requests);
 
                 phasePlan.phases[i] = new ProtoPlanPhase
@@ -6735,25 +10603,30 @@ namespace ProtoTipAI.Editor
             return phasePlan;
         }
 
-        private async Task<ProtoPhaseOutlinePlan> RequestPhaseOutlineAsync(string token, string model, ProtoChatMessage[] baseMessages, string prompt, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
+        private async Task<ProtoPhaseOutlinePlan> RequestPhaseOutlineAsync(ProtoProviderSnapshot settings, ProtoChatMessage[] baseMessages, string prompt, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
         {
+            if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
+            {
+                return null;
+            }
+
             var messages = new List<ProtoChatMessage>(baseMessages ?? Array.Empty<ProtoChatMessage>())
             {
                 new ProtoChatMessage
                 {
                     role = "user",
-                    content = "Decide how many phases are needed to reach a 100% functional prototype. Return ONLY JSON: {\"phases\":[{\"id\":\"phase_1\",\"name\":\"Short Name\",\"goal\":\"One sentence goal\"}]}. Keep 2-5 phases."
+                    content = ProtoPrompts.PhaseOutlineInstruction
                 },
                 new ProtoChatMessage
                 {
                     role = "user",
-                    content = $"Project intent: {prompt}"
+                    content = string.Format(ProtoPrompts.ProjectIntentFormat, prompt)
                 }
             };
             AppendPlanIndexMessages(messages, scriptIndex, prefabIndex, sceneIndex, assetIndex);
 
             await RunOnMainThread(() => BeginApiWait("phase count")).ConfigureAwait(false);
-            var response = await ProtoOpenAIClient.SendChatAsync(token, model, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
+            var response = await ProtoProviderClient.SendChatAsync(settings, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
             await RunOnMainThread(EndApiWait).ConfigureAwait(false);
 
             var json = ExtractJson(response);
@@ -6772,25 +10645,30 @@ namespace ProtoTipAI.Editor
             }
         }
 
-        private async Task<string> RequestPhaseOverviewAsync(string token, string model, ProtoChatMessage[] baseMessages, string prompt, ProtoPhaseOutline outline, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
+        private async Task<string> RequestPhaseOverviewAsync(ProtoProviderSnapshot settings, ProtoChatMessage[] baseMessages, string prompt, ProtoPhaseOutline outline, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
         {
+            if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
+            {
+                return string.Empty;
+            }
+
             var messages = new List<ProtoChatMessage>(baseMessages ?? Array.Empty<ProtoChatMessage>())
             {
                 new ProtoChatMessage
                 {
                     role = "user",
-                    content = "Return ONLY JSON: {\"overview\":\"2-4 sentences describing what will be delivered in this phase.\"}"
+                    content = ProtoPrompts.PhaseOverviewInstruction
                 },
                 new ProtoChatMessage
                 {
                     role = "user",
-                    content = $"Project intent: {prompt}\nPhase: {outline.id} {outline.name}\nGoal: {outline.goal}"
+                    content = string.Format(ProtoPrompts.PhaseOverviewContextFormat, prompt, outline.id, outline.name, outline.goal)
                 }
             };
             AppendPlanIndexMessages(messages, scriptIndex, prefabIndex, sceneIndex, assetIndex);
 
             await RunOnMainThread(() => BeginApiWait($"phase {outline.id} overview")).ConfigureAwait(false);
-            var response = await ProtoOpenAIClient.SendChatAsync(token, model, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
+            var response = await ProtoProviderClient.SendChatAsync(settings, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
             await RunOnMainThread(EndApiWait).ConfigureAwait(false);
 
             var json = ExtractJson(response);
@@ -6810,25 +10688,30 @@ namespace ProtoTipAI.Editor
             }
         }
 
-        private async Task<ProtoFeatureRequest[]> RequestPhaseFeatureRequestsAsync(string token, string model, ProtoChatMessage[] baseMessages, string prompt, ProtoPhaseOutline outline, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
+        private async Task<ProtoFeatureRequest[]> RequestPhaseFeatureRequestsAsync(ProtoProviderSnapshot settings, ProtoChatMessage[] baseMessages, string prompt, ProtoPhaseOutline outline, CancellationToken cancellationToken, string scriptIndex, string prefabIndex, string sceneIndex, string assetIndex)
         {
+            if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
+            {
+                return Array.Empty<ProtoFeatureRequest>();
+            }
+
             var messages = new List<ProtoChatMessage>(baseMessages ?? Array.Empty<ProtoChatMessage>())
             {
                 new ProtoChatMessage
                 {
                     role = "user",
-                    content = "Return ONLY a JSON object with the schema: {\"featureRequests\":[{\"id\":\"optional\",\"type\":\"folder|script|scene|prefab|material|asset\",\"name\":\"DisplayName\",\"path\":\"Assets/...\",\"dependsOn\":[\"id1\",\"id2\"],\"notes\":\"optional\"}]}. All paths must live under Assets/Project. For scripts, path must be the folder (not the .cs file) and name must be a valid C# identifier (letters/numbers/underscore, start with letter or underscore, no spaces). For prefabs, path can be a folder or a .prefab path; notes should mention cube/box, sphere, capsule, cylinder, plane, quad, character controller, or empty. For scenes, path should be a .unity asset path or a folder; include notes like \"prefabs: A,B\" and \"managers: X,Y\" (and optionally \"ui\" or \"spawn\") and add dependsOn to those prefabs/scripts. For materials, path can be a folder or a .mat path; notes can mention URP/HDRP/Standard. Avoid names already present in the Script/Prefab/Scene/Asset indexes."
+                    content = ProtoPrompts.FeatureRequestsInstruction
                 },
                 new ProtoChatMessage
                 {
                     role = "user",
-                    content = $"Project intent: {prompt}\nPhase: {outline.id} {outline.name}\nGoal: {outline.goal}\nOnly include feature requests needed for this phase."
+                    content = string.Format(ProtoPrompts.FeatureRequestsContextFormat, prompt, outline.id, outline.name, outline.goal)
                 }
             };
             AppendPlanIndexMessages(messages, scriptIndex, prefabIndex, sceneIndex, assetIndex);
 
             await RunOnMainThread(() => BeginApiWait($"phase {outline.id} requests")).ConfigureAwait(false);
-            var response = await ProtoOpenAIClient.SendChatAsync(token, model, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
+            var response = await ProtoProviderClient.SendChatAsync(settings, messages.ToArray(), _apiWaitTimeoutSeconds, cancellationToken).ConfigureAwait(false);
             await RunOnMainThread(EndApiWait).ConfigureAwait(false);
 
             var json = ExtractJson(response);
@@ -6876,6 +10759,7 @@ namespace ProtoTipAI.Editor
                     {
                         continue;
                     }
+                    TagRequestsWithPhase(phase.featureRequests, phase);
                     results.AddRange(phase.featureRequests);
                 }
                 return results;
@@ -6890,10 +10774,661 @@ namespace ProtoTipAI.Editor
             var selected = phasePlan.phases[index];
             if (selected?.featureRequests != null)
             {
+                TagRequestsWithPhase(selected.featureRequests, selected);
                 results.AddRange(selected.featureRequests);
             }
 
             return results;
+        }
+
+        private static List<ProtoFeatureRequest> ExpandFeatureSteps(List<ProtoFeatureRequest> requests)
+        {
+            if (requests == null || requests.Count == 0)
+            {
+                return requests ?? new List<ProtoFeatureRequest>();
+            }
+
+            var results = new List<ProtoFeatureRequest>(requests);
+            var usedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var request in results)
+            {
+                if (!string.IsNullOrWhiteSpace(request?.id))
+                {
+                    usedIds.Add(request.id);
+                }
+            }
+
+            var identitySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var request in results)
+            {
+                var key = BuildRequestIdentity(request);
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    identitySet.Add(key);
+                }
+            }
+
+            var now = DateTime.UtcNow.ToString("o");
+            foreach (var request in requests)
+            {
+                if (request?.steps == null || request.steps.Length == 0)
+                {
+                    continue;
+                }
+
+                var parentType = (request.type ?? string.Empty).Trim();
+                var parentTypeMatches = false;
+                var generatedAny = false;
+
+                foreach (var step in request.steps)
+                {
+                    if (step == null)
+                    {
+                        continue;
+                    }
+
+                    var stepType = string.IsNullOrWhiteSpace(step.type) ? parentType : step.type.Trim();
+                    if (!IsPrimaryStepType(stepType))
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(parentType) &&
+                        string.Equals(stepType, parentType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        parentTypeMatches = true;
+                    }
+
+                    var stepName = step.name?.Trim();
+                    var stepPath = string.IsNullOrWhiteSpace(step.path) ? request.path : step.path.Trim();
+                    if (string.IsNullOrWhiteSpace(stepName) && string.IsNullOrWhiteSpace(stepPath))
+                    {
+                        continue;
+                    }
+
+                    var detail = new ProtoFeatureRequest
+                    {
+                        id = string.IsNullOrWhiteSpace(step.id) ? null : step.id.Trim(),
+                        type = stepType,
+                        name = stepName,
+                        path = stepPath,
+                        phaseId = request.phaseId,
+                        phaseName = request.phaseName,
+                        notes = string.IsNullOrWhiteSpace(step.notes)
+                            ? $"Step for {request.name ?? request.type ?? "request"}."
+                            : step.notes.Trim(),
+                        createdAt = now,
+                        updatedAt = now
+                    };
+                    detail.type = detail.type?.Trim();
+                    detail.path = NormalizePathForType(detail.type, detail.path);
+                    NormalizeScriptRequestName(detail, true);
+                    detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                    var deps = new List<string>();
+                    if (!string.IsNullOrWhiteSpace(request.id))
+                    {
+                        deps.Add(request.id);
+                    }
+                    if (step.dependsOn != null)
+                    {
+                        deps.AddRange(step.dependsOn);
+                    }
+                    detail.dependsOn = BuildDependencyArray(deps);
+
+                    var detailKey = BuildRequestIdentity(detail);
+                    if (!string.IsNullOrWhiteSpace(detailKey) && identitySet.Contains(detailKey))
+                    {
+                        continue;
+                    }
+
+                    AddDetailRequest(results, detail, usedIds, identitySet);
+                    generatedAny = true;
+                }
+
+                if (generatedAny && parentTypeMatches)
+                {
+                    request.SetStatus(ProtoAgentRequestStatus.Done);
+                    request.notes = AppendNote(request.notes, "Expanded into steps.");
+                    request.updatedAt = now;
+                }
+            }
+
+            return results;
+        }
+
+        private static bool IsPrimaryStepType(string type)
+        {
+            if (string.IsNullOrWhiteSpace(type))
+            {
+                return false;
+            }
+
+            switch (type.Trim().ToLowerInvariant())
+            {
+                case "folder":
+                case "script":
+                case "scene":
+                case "prefab":
+                case "material":
+                case "asset":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static List<ProtoFeatureRequest> ExpandPrefabAndSceneDetails(List<ProtoFeatureRequest> requests)
+        {
+            if (requests == null || requests.Count == 0)
+            {
+                return requests ?? new List<ProtoFeatureRequest>();
+            }
+
+            var results = new List<ProtoFeatureRequest>(requests);
+            var usedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var request in results)
+            {
+                if (!string.IsNullOrWhiteSpace(request?.id))
+                {
+                    usedIds.Add(request.id);
+                }
+            }
+
+            var requestLookup = BuildRequestLookup(results);
+            var scriptByName = BuildScriptRequestMap(results);
+            var identitySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var request in results)
+            {
+                var key = BuildRequestIdentity(request);
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    identitySet.Add(key);
+                }
+            }
+
+            var now = DateTime.UtcNow.ToString("o");
+            foreach (var request in requests)
+            {
+                if (request == null || string.IsNullOrWhiteSpace(request.type))
+                {
+                    continue;
+                }
+
+                if (string.Equals(request.type, "prefab", StringComparison.OrdinalIgnoreCase) ||
+                    (string.Equals(request.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikePrefabRequest(request)))
+                {
+                    AddPrefabComponentRequests(request, requestLookup, scriptByName, results, usedIds, identitySet, now);
+                    continue;
+                }
+
+                if (string.Equals(request.type, "scene", StringComparison.OrdinalIgnoreCase) ||
+                    (string.Equals(request.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikeSceneRequest(request)))
+                {
+                    AddSceneDetailRequests(request, requestLookup, scriptByName, results, usedIds, identitySet, now);
+                }
+            }
+
+            return results;
+        }
+
+        private static Dictionary<string, ProtoFeatureRequest> BuildScriptRequestMap(List<ProtoFeatureRequest> requests)
+        {
+            var results = new Dictionary<string, ProtoFeatureRequest>(StringComparer.OrdinalIgnoreCase);
+            if (requests == null)
+            {
+                return results;
+            }
+
+            foreach (var request in requests)
+            {
+                if (request == null || !string.Equals(request.type, "script", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var name = request.name?.Trim();
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    results[name] = request;
+                }
+            }
+
+            return results;
+        }
+
+        private static void AddPrefabComponentRequests(
+            ProtoFeatureRequest request,
+            Dictionary<string, ProtoFeatureRequest> requestLookup,
+            Dictionary<string, ProtoFeatureRequest> scriptByName,
+            List<ProtoFeatureRequest> results,
+            HashSet<string> usedIds,
+            HashSet<string> identitySet,
+            string timestamp)
+        {
+            var componentNames = CollectPrefabComponentNames(request, requestLookup);
+            var prefabName = GetPrefabName(request);
+            var prefabPath = BuildPlannedPrefabPath(request.path, prefabName);
+            var uniqueNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var prefabLabel = string.IsNullOrWhiteSpace(prefabName) ? "Prefab" : prefabName;
+            var hasStepComponents = false;
+
+            if (request?.steps != null)
+            {
+                foreach (var step in request.steps)
+                {
+                    if (step == null || !string.Equals(step.type, "prefab_component", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var stepName = step.name?.Trim();
+                    if (string.IsNullOrWhiteSpace(stepName) || !uniqueNames.Add(stepName))
+                    {
+                        continue;
+                    }
+
+                    hasStepComponents = true;
+                    var detail = new ProtoFeatureRequest
+                    {
+                        id = string.IsNullOrWhiteSpace(step.id) ? null : step.id.Trim(),
+                        type = "prefab_component",
+                        name = stepName,
+                        path = prefabPath,
+                        phaseId = request.phaseId,
+                        phaseName = request.phaseName,
+                        notes = string.IsNullOrWhiteSpace(step.notes) ? $"Prefab component for {prefabLabel}." : step.notes,
+                        createdAt = timestamp,
+                        updatedAt = timestamp
+                    };
+                    detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                    var deps = new List<string>();
+                    if (!string.IsNullOrWhiteSpace(request.id))
+                    {
+                        deps.Add(request.id);
+                    }
+                    if (step.dependsOn != null)
+                    {
+                        deps.AddRange(step.dependsOn);
+                    }
+                    if (scriptByName.TryGetValue(stepName, out var scriptRequest) && !string.IsNullOrWhiteSpace(scriptRequest.id))
+                    {
+                        deps.Add(scriptRequest.id);
+                    }
+                    detail.dependsOn = BuildDependencyArray(deps);
+
+                    AddDetailRequest(results, detail, usedIds, identitySet);
+                }
+            }
+
+            if (componentNames.Count == 0 && !hasStepComponents)
+            {
+                return;
+            }
+
+            foreach (var componentName in componentNames)
+            {
+                var trimmed = componentName?.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed) || !uniqueNames.Add(trimmed))
+                {
+                    continue;
+                }
+
+                var detail = new ProtoFeatureRequest
+                {
+                    type = "prefab_component",
+                    name = trimmed,
+                    path = prefabPath,
+                    phaseId = request.phaseId,
+                    phaseName = request.phaseName,
+                    notes = $"Prefab component for {prefabLabel}.",
+                    createdAt = timestamp,
+                    updatedAt = timestamp
+                };
+                detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                var deps = new List<string>();
+                if (!string.IsNullOrWhiteSpace(request.id))
+                {
+                    deps.Add(request.id);
+                }
+                if (scriptByName.TryGetValue(trimmed, out var scriptRequest) && !string.IsNullOrWhiteSpace(scriptRequest.id))
+                {
+                    deps.Add(scriptRequest.id);
+                }
+                detail.dependsOn = BuildDependencyArray(deps);
+
+                AddDetailRequest(results, detail, usedIds, identitySet);
+            }
+        }
+
+        private static void AddSceneDetailRequests(
+            ProtoFeatureRequest request,
+            Dictionary<string, ProtoFeatureRequest> requestLookup,
+            Dictionary<string, ProtoFeatureRequest> scriptByName,
+            List<ProtoFeatureRequest> results,
+            HashSet<string> usedIds,
+            HashSet<string> identitySet,
+            string timestamp)
+        {
+            var sceneName = GetSceneName(request);
+            var scenePath = BuildPlannedScenePath(request.path, sceneName);
+            var sceneId = request.id ?? string.Empty;
+
+            var prefabNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var managerNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (request?.steps != null)
+            {
+                foreach (var step in request.steps)
+                {
+                    if (step == null || string.IsNullOrWhiteSpace(step.type))
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(step.type, "scene_prefab", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var stepName = step.name?.Trim();
+                        if (string.IsNullOrWhiteSpace(stepName) || !prefabNames.Add(stepName))
+                        {
+                            continue;
+                        }
+
+                        var detail = new ProtoFeatureRequest
+                        {
+                            id = string.IsNullOrWhiteSpace(step.id) ? null : step.id.Trim(),
+                            type = "scene_prefab",
+                            name = stepName,
+                            path = scenePath,
+                            phaseId = request.phaseId,
+                            phaseName = request.phaseName,
+                            notes = string.IsNullOrWhiteSpace(step.notes) ? $"prefabs: {stepName}" : step.notes,
+                            createdAt = timestamp,
+                            updatedAt = timestamp
+                        };
+                        detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                        var deps = new List<string>();
+                        if (!string.IsNullOrWhiteSpace(sceneId))
+                        {
+                            deps.Add(sceneId);
+                        }
+                        if (step.dependsOn != null)
+                        {
+                            deps.AddRange(step.dependsOn);
+                        }
+
+                        var prefabRequestId = FindPrefabRequestIdByName(stepName, requestLookup);
+                        if (!string.IsNullOrWhiteSpace(prefabRequestId))
+                        {
+                            deps.Add(prefabRequestId);
+                        }
+
+                        detail.dependsOn = BuildDependencyArray(deps);
+                        AddDetailRequest(results, detail, usedIds, identitySet);
+                        continue;
+                    }
+
+                    if (string.Equals(step.type, "scene_manager", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var stepName = step.name?.Trim();
+                        if (string.IsNullOrWhiteSpace(stepName) || !managerNames.Add(stepName))
+                        {
+                            continue;
+                        }
+
+                        var detail = new ProtoFeatureRequest
+                        {
+                            id = string.IsNullOrWhiteSpace(step.id) ? null : step.id.Trim(),
+                            type = "scene_manager",
+                            name = stepName,
+                            path = scenePath,
+                            phaseId = request.phaseId,
+                            phaseName = request.phaseName,
+                            notes = string.IsNullOrWhiteSpace(step.notes) ? $"managers: {stepName}" : step.notes,
+                            createdAt = timestamp,
+                            updatedAt = timestamp
+                        };
+                        detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                        var deps = new List<string>();
+                        if (!string.IsNullOrWhiteSpace(sceneId))
+                        {
+                            deps.Add(sceneId);
+                        }
+                        if (step.dependsOn != null)
+                        {
+                            deps.AddRange(step.dependsOn);
+                        }
+                        if (scriptByName.TryGetValue(stepName, out var scriptRequest) && !string.IsNullOrWhiteSpace(scriptRequest.id))
+                        {
+                            deps.Add(scriptRequest.id);
+                        }
+
+                        detail.dependsOn = BuildDependencyArray(deps);
+                        AddDetailRequest(results, detail, usedIds, identitySet);
+                    }
+                }
+            }
+
+            if (request.dependsOn != null && requestLookup != null)
+            {
+                foreach (var depId in request.dependsOn)
+                {
+                    if (string.IsNullOrWhiteSpace(depId))
+                    {
+                        continue;
+                    }
+
+                    if (!requestLookup.TryGetValue(depId, out var depRequest) || depRequest == null)
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(depRequest.type, "prefab", StringComparison.OrdinalIgnoreCase) &&
+                        !(string.Equals(depRequest.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikePrefabRequest(depRequest)))
+                    {
+                        continue;
+                    }
+
+                    var prefabName = GetPrefabName(depRequest);
+                    if (string.IsNullOrWhiteSpace(prefabName) || !prefabNames.Add(prefabName))
+                    {
+                        continue;
+                    }
+
+                    var detail = new ProtoFeatureRequest
+                    {
+                        type = "scene_prefab",
+                        name = prefabName,
+                        path = scenePath,
+                        phaseId = request.phaseId,
+                        phaseName = request.phaseName,
+                        createdAt = timestamp,
+                        updatedAt = timestamp
+                    };
+                    detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                    var deps = new List<string>();
+                    if (!string.IsNullOrWhiteSpace(sceneId))
+                    {
+                        deps.Add(sceneId);
+                    }
+                    deps.Add(depId);
+                    detail.dependsOn = BuildDependencyArray(deps);
+
+                    AddDetailRequest(results, detail, usedIds, identitySet);
+                }
+            }
+
+            foreach (var name in ParseScenePrefabNamesFromNotes(request.notes))
+            {
+                if (string.IsNullOrWhiteSpace(name) || !prefabNames.Add(name.Trim()))
+                {
+                    continue;
+                }
+
+                var detail = new ProtoFeatureRequest
+                {
+                    type = "scene_prefab",
+                    name = name.Trim(),
+                    path = scenePath,
+                    phaseId = request.phaseId,
+                    phaseName = request.phaseName,
+                    notes = $"prefabs: {name.Trim()}",
+                    createdAt = timestamp,
+                    updatedAt = timestamp
+                };
+                detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                if (!string.IsNullOrWhiteSpace(sceneId))
+                {
+                    detail.dependsOn = BuildDependencyArray(new List<string> { sceneId });
+                }
+
+                AddDetailRequest(results, detail, usedIds, identitySet);
+            }
+
+            var sceneManagerNames = CollectSceneManagerComponents(request, requestLookup);
+            foreach (var managerName in sceneManagerNames)
+            {
+                var trimmed = managerName?.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed) || !managerNames.Add(trimmed))
+                {
+                    continue;
+                }
+
+                var detail = new ProtoFeatureRequest
+                {
+                    type = "scene_manager",
+                    name = trimmed,
+                    path = scenePath,
+                    phaseId = request.phaseId,
+                    phaseName = request.phaseName,
+                    notes = $"managers: {trimmed}",
+                    createdAt = timestamp,
+                    updatedAt = timestamp
+                };
+                detail.SetStatus(ProtoAgentRequestStatus.Todo);
+
+                var deps = new List<string>();
+                if (!string.IsNullOrWhiteSpace(sceneId))
+                {
+                    deps.Add(sceneId);
+                }
+                if (scriptByName.TryGetValue(trimmed, out var scriptRequest) && !string.IsNullOrWhiteSpace(scriptRequest.id))
+                {
+                    deps.Add(scriptRequest.id);
+                }
+                detail.dependsOn = BuildDependencyArray(deps);
+
+                AddDetailRequest(results, detail, usedIds, identitySet);
+            }
+        }
+
+        private static string[] BuildDependencyArray(List<string> dependencies)
+        {
+            if (dependencies == null || dependencies.Count == 0)
+            {
+                return null;
+            }
+
+            var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var results = new List<string>();
+            foreach (var dep in dependencies)
+            {
+                var trimmed = dep?.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed))
+                {
+                    continue;
+                }
+
+                if (unique.Add(trimmed))
+                {
+                    results.Add(trimmed);
+                }
+            }
+
+            return results.Count == 0 ? null : results.ToArray();
+        }
+
+        private static string FindPrefabRequestIdByName(string prefabName, Dictionary<string, ProtoFeatureRequest> requestLookup)
+        {
+            if (string.IsNullOrWhiteSpace(prefabName) || requestLookup == null)
+            {
+                return string.Empty;
+            }
+
+            var trimmed = prefabName.Trim();
+            foreach (var request in requestLookup.Values)
+            {
+                if (request == null)
+                {
+                    continue;
+                }
+
+                var isPrefab = string.Equals(request.type, "prefab", StringComparison.OrdinalIgnoreCase)
+                    || (string.Equals(request.type, "asset", StringComparison.OrdinalIgnoreCase) && LooksLikePrefabRequest(request));
+                if (!isPrefab)
+                {
+                    continue;
+                }
+
+                var name = GetPrefabName(request);
+                if (string.Equals(name?.Trim(), trimmed, StringComparison.OrdinalIgnoreCase))
+                {
+                    return request.id ?? string.Empty;
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private static void AddDetailRequest(
+            List<ProtoFeatureRequest> results,
+            ProtoFeatureRequest detail,
+            HashSet<string> usedIds,
+            HashSet<string> identitySet)
+        {
+            if (detail == null)
+            {
+                return;
+            }
+
+            var key = BuildRequestIdentity(detail);
+            if (!string.IsNullOrWhiteSpace(key) && identitySet.Contains(key))
+            {
+                return;
+            }
+
+            detail.id = EnsureRequestId(detail, usedIds);
+            if (!string.IsNullOrWhiteSpace(key))
+            {
+                identitySet.Add(key);
+            }
+            results.Add(detail);
+        }
+
+        private static void TagRequestsWithPhase(ProtoFeatureRequest[] requests, ProtoPlanPhase phase)
+        {
+            if (requests == null || phase == null)
+            {
+                return;
+            }
+
+            var phaseId = phase.id?.Trim();
+            var phaseName = string.IsNullOrWhiteSpace(phase.name) ? phase.id : phase.name;
+            foreach (var request in requests)
+            {
+                if (request == null)
+                {
+                    continue;
+                }
+
+                request.phaseId = phaseId;
+                request.phaseName = phaseName;
+            }
         }
 
         private static List<ProtoFeatureRequest> BuildFeatureRequestList(ProtoFeatureRequest[] requests)
@@ -6919,7 +11454,7 @@ namespace ProtoTipAI.Editor
                 request.id = EnsureRequestId(request, usedIds);
 
                 request.path = NormalizePathForType(request.type, request.path);
-                request.status = "todo";
+                request.SetStatus(ProtoAgentRequestStatus.Todo);
                 request.createdAt = DateTime.UtcNow.ToString("o");
                 request.updatedAt = request.createdAt;
 
@@ -6958,7 +11493,7 @@ namespace ProtoTipAI.Editor
                         type = "folder",
                         name = Path.GetFileName(folderPath),
                         path = folderPath,
-                        status = "todo",
+                        status = ProtoAgentRequestStatus.Todo.ToNormalizedString(),
                         createdAt = DateTime.UtcNow.ToString("o"),
                         updatedAt = DateTime.UtcNow.ToString("o")
                     };
@@ -7134,7 +11669,7 @@ namespace ProtoTipAI.Editor
                     continue;
                 }
 
-                request.status = "done";
+                request.SetStatus(ProtoAgentRequestStatus.Done);
                 request.notes = AppendNote(request.notes, $"Skipped duplicate of {replacement}.");
                 request.updatedAt = DateTime.UtcNow.ToString("o");
                 ProtoFeatureRequestStore.SaveRequest(request);
@@ -7246,11 +11781,36 @@ namespace ProtoTipAI.Editor
                     var path = BuildPlannedPrefabPath(request.path, name);
                     return string.IsNullOrWhiteSpace(path) ? string.Empty : $"prefab:{path}";
                 }
+                case "prefab_component":
+                {
+                    var prefabPath = request.path ?? string.Empty;
+                    var componentName = request.name ?? string.Empty;
+                    var normalizedPrefab = string.IsNullOrWhiteSpace(prefabPath) ? string.Empty : EnsureProjectPath(prefabPath);
+                    return string.IsNullOrWhiteSpace(normalizedPrefab) || string.IsNullOrWhiteSpace(componentName)
+                        ? string.Empty
+                        : $"prefab_component:{normalizedPrefab}:{componentName.Trim()}";
+                }
                 case "scene":
                 {
                     var name = GetSceneName(request);
                     var path = BuildPlannedScenePath(request.path, name);
                     return string.IsNullOrWhiteSpace(path) ? string.Empty : $"scene:{path}";
+                }
+                case "scene_prefab":
+                {
+                    var scenePath = string.IsNullOrWhiteSpace(request.path) ? string.Empty : EnsureProjectPath(request.path);
+                    var prefabName = request.name ?? string.Empty;
+                    return string.IsNullOrWhiteSpace(scenePath) || string.IsNullOrWhiteSpace(prefabName)
+                        ? string.Empty
+                        : $"scene_prefab:{scenePath}:{prefabName.Trim()}";
+                }
+                case "scene_manager":
+                {
+                    var scenePath = string.IsNullOrWhiteSpace(request.path) ? string.Empty : EnsureProjectPath(request.path);
+                    var managerName = request.name ?? string.Empty;
+                    return string.IsNullOrWhiteSpace(scenePath) || string.IsNullOrWhiteSpace(managerName)
+                        ? string.Empty
+                        : $"scene_manager:{scenePath}:{managerName.Trim()}";
                 }
                 case "material":
                 {
@@ -8040,6 +12600,196 @@ namespace ProtoTipAI.Editor
             return $"{ProjectRoot}/{normalized.TrimStart('/')}";
         }
 
+        private struct AgentActionResult
+        {
+            public bool stop;
+            public string historyEntry;
+        }
+
+        private struct AgentReadSnapshot
+        {
+            public bool truncated;
+        }
+
+        private sealed class ProtoAgentCommandWindow : EditorWindow
+        {
+            private ProtoChatWindow _owner;
+            private Vector2 _scroll;
+            private string _reviewScriptQuery = string.Empty;
+
+            public static void Show(ProtoChatWindow owner)
+            {
+                if (owner == null)
+                {
+                    return;
+                }
+
+                var window = CreateInstance<ProtoAgentCommandWindow>();
+                window._owner = owner;
+                window.titleContent = new GUIContent("Command");
+                window.minSize = new Vector2(360f, 420f);
+                window.ShowUtility();
+            }
+
+            private void OnGUI()
+            {
+                if (_owner == null)
+                {
+                    EditorGUILayout.HelpBox("Proto Chat is not available.", MessageType.Info);
+                    if (GUILayout.Button("Close"))
+                    {
+                        Close();
+                    }
+                    return;
+                }
+
+                var isBusy = _owner.IsOperationActive() || _owner._isCompactingSession;
+                var hasApiKey = ProtoProviderSettings.HasApiKey();
+                var hasPlan = !string.IsNullOrWhiteSpace(_owner._lastPlanJson);
+
+                EditorGUILayout.HelpBox("Choose a command to run. Some actions require an API key.", MessageType.Info);
+
+                using (var scroll = new EditorGUILayout.ScrollViewScope(_scroll))
+                {
+                    _scroll = scroll.scrollPosition;
+
+                    EditorGUILayout.LabelField("Agent", EditorStyles.boldLabel);
+                    using (new EditorGUI.DisabledScope(isBusy || !hasApiKey))
+                    {
+                        if (GUILayout.Button("Continue Agent"))
+                        {
+                            _ = _owner.RunAgentLoopAsync("continue");
+                            Close();
+                            return;
+                        }
+                    }
+
+                    EditorGUILayout.Space(6f);
+                    EditorGUILayout.LabelField("Planning", EditorStyles.boldLabel);
+                    using (new EditorGUI.DisabledScope(isBusy || !hasApiKey))
+                    {
+                        if (GUILayout.Button("Generate Plan"))
+                        {
+                            _ = _owner.GeneratePlanAsync();
+                            Close();
+                            return;
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(isBusy || !hasApiKey || !hasPlan))
+                    {
+                        if (GUILayout.Button("Create Feature Requests"))
+                        {
+                            _ = _owner.CreateFeatureRequestsAsync(_owner._lastPlanJson);
+                            Close();
+                            return;
+                        }
+
+                        if (GUILayout.Button("Apply Plan"))
+                        {
+                            _ = _owner.ApplyPlanAsync();
+                            Close();
+                            return;
+                        }
+                    }
+
+                    EditorGUILayout.Space(6f);
+                    EditorGUILayout.LabelField("Apply Stage", EditorStyles.boldLabel);
+                    using (new EditorGUI.DisabledScope(isBusy || !hasApiKey || !hasPlan))
+                    {
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            if (GUILayout.Button("Folders"))
+                            {
+                                _ = _owner.ApplyPlanStageAsync("folders", new[] { "folder" });
+                                Close();
+                                return;
+                            }
+                            if (GUILayout.Button("Scripts"))
+                            {
+                                _ = _owner.ApplyPlanStageAsync("scripts", new[] { "script" });
+                                Close();
+                                return;
+                            }
+                        }
+
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            if (GUILayout.Button("Materials"))
+                            {
+                                _ = _owner.ApplyPlanStageAsync("materials", new[] { "material" });
+                                Close();
+                                return;
+                            }
+                            if (GUILayout.Button("Prefabs"))
+                            {
+                                _ = _owner.ApplyPlanStageAsync("prefabs", new[] { "prefab", "prefab_component" });
+                                Close();
+                                return;
+                            }
+                        }
+
+                        using (new EditorGUILayout.HorizontalScope())
+                        {
+                            if (GUILayout.Button("Scenes"))
+                            {
+                                _ = _owner.ApplyPlanStageAsync("scenes", new[] { "scene", "scene_prefab", "scene_manager" });
+                                Close();
+                                return;
+                            }
+                            if (GUILayout.Button("Assets"))
+                            {
+                                _ = _owner.ApplyPlanStageAsync("assets", new[] { "asset" });
+                                Close();
+                                return;
+                            }
+                        }
+                    }
+
+                    EditorGUILayout.Space(6f);
+                    EditorGUILayout.LabelField("Fix", EditorStyles.boldLabel);
+                    using (new EditorGUI.DisabledScope(isBusy || !hasApiKey))
+                    {
+                        if (GUILayout.Button("Fix Step"))
+                        {
+                            _ = _owner.RunFixPassAsync();
+                            Close();
+                            return;
+                        }
+                    }
+
+                    EditorGUILayout.Space(6f);
+                    EditorGUILayout.LabelField("Review Script", EditorStyles.boldLabel);
+                    _reviewScriptQuery = EditorGUILayout.TextField("Script", _reviewScriptQuery);
+                    using (new EditorGUI.DisabledScope(isBusy || !hasApiKey || string.IsNullOrWhiteSpace(_reviewScriptQuery)))
+                    {
+                        if (GUILayout.Button("Review"))
+                        {
+                            var request = $"review {_reviewScriptQuery.Trim()}";
+                            _ = _owner.ReviewScriptAsync(request);
+                            Close();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        [Serializable]
+        private sealed class ProtoAgentAction
+        {
+            public string action;
+            public string path;
+            public string content;
+            public string query;
+            public string stage;
+            public string scope;
+            public string message;
+            public int lineStart;
+            public int lineEnd;
+            public string range;
+        }
+
         [Serializable]
         private sealed class ProtoPhaseOutlinePlan
         {
@@ -8060,26 +12810,5 @@ namespace ProtoTipAI.Editor
             public string overview;
         }
 
-        [Serializable]
-        private sealed class ProtoPhasePlan
-        {
-            public ProtoPlanPhase[] phases;
-        }
-
-        [Serializable]
-        private sealed class ProtoPlanPhase
-        {
-            public string id;
-            public string name;
-            public string goal;
-            public string overview;
-            public ProtoFeatureRequest[] featureRequests;
-        }
-
-        [Serializable]
-        private sealed class ProtoGenerationPlan
-        {
-            public ProtoFeatureRequest[] featureRequests;
-        }
     }
 }

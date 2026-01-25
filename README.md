@@ -11,6 +11,30 @@ Copy the `ProtoTipAI` folder into your project's `Assets` folder.
 - Unity 2022.3+ (tested)
 - OpenAI API key
 
+## Features
+
+ProtoTip is a Unity-native agentic workflow: describe the goal, the agent plans, breaks the work into feature requests, and applies changes while keeping a persistent session you can resume anytime.
+
+- Agentic Chat: tool-using loop that can read/write/list/search and run plan/stage/fix actions, with retries and knowing when to stop.
+- Session memory: per-session history saved to disk, continue-last flow, and automatic compaction summaries to keep context focused.
+- Guided planning: configurable plan prompt, optional phased plans, and structured feature requests with dependencies and steps.
+- Safe execution controls: apply the full plan or run by stage (folders/scripts/materials/prefabs/scenes/assets) with progress, confirmations, and post-stage fix passes.
+- Unity scaffolding: generates folders, scripts, prefabs, scenes, materials, generic assets, plus prefab components and scene managers/prefabs.
+- Context awareness: project goal + summary and toggles for selection/scene/recent assets/console context.
+- Diagnostics + indexes: surfaces Unity Console errors and builds Script/Prefab/Scene/Asset indexes to reduce hallucinated types.
+- Command palette + tool bench: quick commands for common actions and manual read/write/list/search without leaving the editor.
+- Clean UI: Setup, Chat, Control, and Plan Tracking windows for each stage of the workflow.
+- Provider flexibility: OpenAI and OpenCode Zen (OpenAI-compatible), custom API URL, model selection, API key stored in EditorPrefs.
+- Script review: review an existing script by name/path and get a corrected file.
+
+## Artifacts & Storage
+
+- Generated content: `Assets/Project`.
+- Plan raw JSON: `Assets/Plan/PlanRaw.json`.
+- Feature requests (per item): `Assets/Plan/*.json`.
+- Indexes: `Assets/Plan/ScriptIndex.md`, `Assets/Plan/PrefabIndex.md`, `Assets/Plan/SceneIndex.md`, `Assets/Plan/AssetIndex.md`.
+- Chat sessions: `Assets/Plan/ChatSessions/ChatSessions.json` and `Assets/Plan/ChatSessions/<sessionId>.json`.
+
 ## Quick Start
 
 1. Open menu `Proto -> Setup`:

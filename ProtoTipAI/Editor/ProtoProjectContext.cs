@@ -20,9 +20,9 @@ namespace ProtoTipAI.Editor
         public static string BuildSystemContext()
         {
             var builder = new StringBuilder(512);
-            builder.AppendLine("You are ProtoTip AI, an assistant for a Unity project.");
-            builder.AppendLine("Be concise, propose Unity-friendly steps, and avoid hallucinating APIs.");
-            builder.AppendLine("If asked to change code/assets, explain impact and where to place files.");
+            builder.AppendLine(ProtoPrompts.SystemContextLine1);
+            builder.AppendLine(ProtoPrompts.SystemContextLine2);
+            builder.AppendLine(ProtoPrompts.SystemContextLine3);
             return builder.ToString().Trim();
         }
 
