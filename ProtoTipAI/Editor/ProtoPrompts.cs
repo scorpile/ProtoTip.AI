@@ -107,17 +107,23 @@ namespace ProtoTipAI.Editor
             "You are an autonomous Unity agent operating inside ProtoTip. Decide the next single action that moves the goal forward. " +
             "Use the available tools; do not ask the user to open files, copy logs, or run searches. " +
             "If you need more context, use read_file, list_folder, or search_text. Prefer small, verifiable steps. " +
+            "Use scene_edit to adjust Unity scenes (prefabs, components, lights, transforms, objects) when needed. " +
             "Do not repeat the same tool call with identical parameters; if a file was truncated, request a line range.";
 
         public const string AgentLoopToolSchema =
-            "Return ONLY JSON: {\"action\":\"read_file|write_file|list_folder|search_text|apply_plan|apply_stage|fix_pass|respond|stop\"," +
+            "Return ONLY JSON: {\"action\":\"read_file|write_file|list_folder|search_text|apply_plan|apply_stage|fix_pass|scene_edit|respond|stop\"," +
             "\"path\":\"optional\",\"content\":\"optional\",\"query\":\"optional\",\"stage\":\"optional\",\"scope\":\"optional\",\"message\":\"optional\"," +
+            "\"scene\":\"optional\",\"edits\":[{\"type\":\"add_light|set_light|add_gameobject|add_prefab|add_component|set_component_field|set_transform|delete_object\"," +
+            "\"name\":\"optional\",\"parent\":\"optional\",\"prefab\":\"optional\",\"component\":\"optional\",\"field\":\"optional\",\"value\":\"optional\",\"reference\":\"optional\"," +
+            "\"lightType\":\"spot|point|directional|area\",\"intensity\":0,\"range\":0,\"spotAngle\":0," +
+            "\"position\":[0,0,0],\"rotation\":[0,0,0],\"scale\":[1,1,1],\"offset\":[0,0,0],\"target\":\"optional\",\"vector\":[0,0,0],\"color\":[1,1,1]}]," +
             "\"lineStart\":0,\"lineEnd\":0,\"range\":\"optional\"}. " +
             "No Markdown, no code fences, no extra text. " +
             "To create or modify code, use write_file with full content. " +
             "For read_file, you can pass lineStart/lineEnd (1-based) or range like \"70-95\" to avoid truncation. " +
             "Use apply_stage stage values: folders|scripts|materials|prefabs|scenes|assets. " +
             "Use fix_pass scope: last_stage|all. " +
+            "Use scene_edit with scene path or scene name in \"scene\" and one or more edits. " +
             "Use respond when you are done and want to summarize. Use stop to end without changes.";
 
         public const string AgentLoopGoalFormat = "Goal: {0}";

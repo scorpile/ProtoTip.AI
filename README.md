@@ -38,7 +38,7 @@ ProtoTip is a Unity-native agentic workflow: describe the goal, the agent plans,
 ## Quick Start
 
 1. Open menu `Proto -> Setup`:
-   - Add OpenAI API Token and select model (I'm testing 5.2)
+   - Add OpenAI API Token and select model (I'm testing gpt-5.2, if you want low token consumption try gpt-5.1-codex-mini)
    - Add Project goal
    - Refresh Summary
    - Save and close
@@ -58,7 +58,69 @@ I've been developing this agent, and you will have a playable prototype at the e
 
 This Agent has a lot of stuff to be implemented, and I realised I cannot continue this project alone. The Unity team started to add AI directly to Unity, so I'm not sure what's the future for this. I do feel I was more advanced than Unity's team ;) but this is far from being even a prototype.
 
-If you want to collaborate, I will be really happy to hear from you.
+If you want to collaborate, I will be really happy to hear from you (on this repo or write to me on scorpile@gmail.com).
+
+## Agent Examples
+
+Paste any of these into the Chat window and press **Agent**. Adjust asset names/paths to match your project.
+
+### Planning & workflow
+
+```text
+Create a plan for a top-down Archero-style prototype in Unity.
+Break the plan into feature requests.
+Apply the full plan now.
+Apply stage: folders.
+Apply stage: scripts.
+Apply stage: prefabs.
+Apply stage: scenes.
+Apply stage: materials.
+Apply stage: assets.
+Run a fix pass for the last stage.
+Run a fix pass for all scripts.
+Continue.
+```
+
+### Core gameplay & scripts
+
+```text
+Create a PlayerController MonoBehaviour for WASD movement and dodge.
+Create an EnemySpawner script that spawns enemies every 5 seconds.
+Add a ScriptableObject named UpgradeDefinition for upgrade data.
+Generate a basic UI canvas with Health and XP bars.
+Add a WaveManager that coordinates spawner difficulty over time.
+```
+
+### Prefabs & assets
+
+```text
+Create a Player prefab with a Capsule, Rigidbody, and PlayerController.
+Create an Enemy prefab with a red material.
+Generate a material for the player (Standard, blue tint).
+Create a simple pickup prefab for health.
+```
+
+### Scene edits (agent tool)
+
+```text
+In ArenaPhase1, add a Spotlight named PlayerKeyLight 3 units above Player and point it at Player.
+In ArenaPhase1, move PlayerSpawn to (0, 0, 0).
+In ArenaPhase1, rotate Main Camera to (20, 0, 0).
+In ArenaPhase1, create an empty GameObject named Managers.
+In ArenaPhase1, delete the GameObject DebugLight.
+```
+
+### Inspection & troubleshooting
+
+```text
+Find the script that defines WaveSpawner and summarize its public API.
+List files under Assets/Project/Scripts.
+Read Assets/Project/Scripts/PlayerController.cs lines 1-120.
+Search Assets/Project for "DamageDealer" and open the matching script.
+Read Assets/Plan/ScriptIndex.md and suggest missing types.
+Review script PlayerController.cs and apply corrections.
+Fix the current console errors.
+```
 
 ## License
 
