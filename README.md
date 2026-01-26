@@ -60,6 +60,11 @@ This Agent has a lot of stuff to be implemented, and I realised I cannot continu
 
 If you want to collaborate, I will be really happy to hear from you (on this repo or write to me on scorpile@gmail.com).
 
+## Demo Video
+
+Everything on this scene was created, placed, and configured by the plugin. It created the Player and objects scripts, added colliders and rigidbodies, and hydrated script values.  
+https://youtu.be/NM0tmGDOUYQ
+
 ## Agent Examples
 
 Paste any of these into the Chat window and press **Agent**. Adjust asset names/paths to match your project.

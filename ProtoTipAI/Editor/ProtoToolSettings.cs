@@ -8,6 +8,14 @@ namespace ProtoTipAI.Editor
         private const string FullAgentKey = "ProtoTipAI.Tools.FullAgent";
         private const string AgentDebugCaptureKey = "ProtoTipAI.Tools.AgentDebugCapture";
 
+        static ProtoToolSettings()
+        {
+            if (!EditorPrefs.HasKey(AgentDebugCaptureKey))
+            {
+                EditorPrefs.SetBool(AgentDebugCaptureKey, false);
+            }
+        }
+
         public static bool GetAutoConfirm()
         {
             return EditorPrefs.GetBool(AutoConfirmKey, false);

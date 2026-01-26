@@ -118,6 +118,7 @@ namespace ProtoTipAI.Editor
         private readonly HashSet<string> _agentToolCallHistory = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _agentSceneEditHistory = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Queue<ProtoAgentAction> _agentPendingActions = new Queue<ProtoAgentAction>();
+        private readonly List<DeferredSceneEdit> _agentDeferredSceneEdits = new List<DeferredSceneEdit>();
         private readonly object _agentDebugLock = new object();
         private bool _agentDebugCaptureEnabled;
         private string _agentDebugLogPath;
@@ -1768,6 +1769,7 @@ namespace ProtoTipAI.Editor
             _agentLastOutcomeTime = string.Empty;
             _agentSceneEditHistory.Clear();
             _agentPendingActions.Clear();
+            _agentDeferredSceneEdits.Clear();
         }
 
         private void SetAgentOutcome(string outcome, int iterations)
@@ -2152,6 +2154,132 @@ namespace ProtoTipAI.Editor
             }
         }
 
+        private void QueueDeferredSceneEditsForScript(string scriptName)
+        {
+            if (string.IsNullOrWhiteSpace(scriptName) || _agentDeferredSceneEdits.Count == 0)
+            {
+                return;
+            }
+
+            var normalizedScript = NormalizeAgentToken(scriptName);
+            var grouped = new Dictionary<string, List<ProtoSceneEditOperation>>(StringComparer.OrdinalIgnoreCase);
+            for (var i = _agentDeferredSceneEdits.Count - 1; i >= 0; i--)
+            {
+                var deferred = _agentDeferredSceneEdits[i];
+                var componentName = deferred?.edit?.component;
+                if (!MatchesComponentName(componentName, normalizedScript))
+                {
+                    continue;
+                }
+
+                var key = string.IsNullOrWhiteSpace(deferred.sceneKey) ? "ActiveScene" : deferred.sceneKey;
+                if (!grouped.TryGetValue(key, out var list))
+                {
+                    list = new List<ProtoSceneEditOperation>();
+                    grouped[key] = list;
+                }
+                list.Add(deferred.edit);
+                _agentDeferredSceneEdits.RemoveAt(i);
+            }
+
+            if (grouped.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var pair in grouped)
+            {
+                var ordered = OrderDeferredSceneEdits(pair.Value);
+                _agentPendingActions.Enqueue(new ProtoAgentAction
+                {
+                    action = "scene_edit",
+                    scene = pair.Key,
+                    edits = ordered.ToArray()
+                });
+            }
+
+            AppendAgentDebugLog("AgentDeferredEditsQueued", $"script={scriptName} count={grouped.Count}");
+        }
+
+        private static bool MatchesComponentName(string componentName, string scriptToken)
+        {
+            if (string.IsNullOrWhiteSpace(componentName) || string.IsNullOrWhiteSpace(scriptToken))
+            {
+                return false;
+            }
+
+            var normalized = NormalizeAgentToken(componentName);
+            if (normalized == scriptToken)
+            {
+                return true;
+            }
+
+            var lastDot = componentName.LastIndexOf('.');
+            if (lastDot >= 0 && lastDot < componentName.Length - 1)
+            {
+                var shortName = componentName.Substring(lastDot + 1);
+                return NormalizeAgentToken(shortName) == scriptToken;
+            }
+
+            return false;
+        }
+
+        private static List<ProtoSceneEditOperation> OrderDeferredSceneEdits(List<ProtoSceneEditOperation> edits)
+        {
+            var ordered = new List<ProtoSceneEditOperation>();
+            if (edits == null || edits.Count == 0)
+            {
+                return ordered;
+            }
+
+            var addComponentKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var edit in edits)
+            {
+                if (!IsSceneEditType(edit, "add_component"))
+                {
+                    continue;
+                }
+
+                var key = BuildComponentEditKey(edit.name, edit.component);
+                if (string.IsNullOrWhiteSpace(key) || !addComponentKeys.Add(key))
+                {
+                    continue;
+                }
+
+                ordered.Add(edit);
+            }
+
+            foreach (var edit in edits)
+            {
+                if (edit != null && !IsSceneEditType(edit, "add_component"))
+                {
+                    ordered.Add(edit);
+                }
+            }
+
+            return ordered;
+        }
+
+        private static bool IsSceneEditType(ProtoSceneEditOperation edit, string type)
+        {
+            if (edit == null || string.IsNullOrWhiteSpace(type))
+            {
+                return false;
+            }
+
+            return NormalizeAgentToken(edit.type) == NormalizeAgentToken(type);
+        }
+
+        private static string BuildComponentEditKey(string targetName, string componentName)
+        {
+            if (string.IsNullOrWhiteSpace(targetName) || string.IsNullOrWhiteSpace(componentName))
+            {
+                return string.Empty;
+            }
+
+            return $"{NormalizeAgentToken(targetName)}|{NormalizeAgentToken(componentName)}";
+        }
+
         private async Task<AgentActionResult> ExecuteAgentActionAsync(ProtoAgentAction action, CancellationToken token)
         {
             AppendAgentDebugLog("AgentAction", DescribeAgentAction(action));
@@ -2394,6 +2522,7 @@ namespace ProtoTipAI.Editor
             }).ConfigureAwait(false);
 
             InvalidateAgentReadMemory(absolutePath);
+            QueueDeferredSceneEditsForScript(Path.GetFileNameWithoutExtension(absolutePath));
 
             var preview = ClampToolOutput(content, AgentMaxToolOutputChars);
             await RunOnMainThread(() => AppendToolMessage("Write File", relativePath, preview)).ConfigureAwait(false);
@@ -2531,37 +2660,31 @@ namespace ProtoTipAI.Editor
             }
 
             string resolvedScenePath = null;
+            string resolvedSceneName = null;
             string summary = null;
             string errorMessage = null;
             string editKey = null;
 
             await RunOnMainThread(() =>
             {
-                if (string.IsNullOrWhiteSpace(sceneKey))
+                var useActiveScene = IsActiveSceneToken(sceneKey) || string.IsNullOrWhiteSpace(sceneKey);
+                var scenePath = string.Empty;
+                if (!useActiveScene)
                 {
-                    var activeScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
-                    if (activeScene.IsValid() && !string.IsNullOrWhiteSpace(activeScene.path))
+                    scenePath = ResolveScenePathForAgent(sceneKey);
+                    if (string.IsNullOrWhiteSpace(scenePath))
                     {
-                        sceneKey = activeScene.path;
+                        errorMessage = "Scene not found. Provide a scene name or path.";
+                        return;
                     }
                 }
 
-                var scenePath = ResolveScenePathForAgent(sceneKey);
-                if (string.IsNullOrWhiteSpace(scenePath))
+                if (!useActiveScene)
                 {
-                    errorMessage = "Scene not found. Provide a scene name or path.";
-                    return;
+                    resolvedScenePath = scenePath;
                 }
 
-                resolvedScenePath = scenePath;
-                editKey = BuildSceneEditKey(scenePath, edits);
-                if (!string.IsNullOrWhiteSpace(editKey) && _agentSceneEditHistory.Contains(editKey))
-                {
-                    summary = "Already attempted.";
-                    return;
-                }
-
-                if (!EnsureAdditiveSceneCreationPossible(out var setupError))
+                if (!useActiveScene && !EnsureAdditiveSceneCreationPossible(out var setupError))
                 {
                     errorMessage = setupError;
                     return;
@@ -2572,13 +2695,37 @@ namespace ProtoTipAI.Editor
                 var openedByTool = false;
                 try
                 {
-                    scene = UnityEngine.SceneManagement.SceneManager.GetSceneByPath(scenePath);
-                    if (!scene.IsValid() || !scene.isLoaded)
+                    if (useActiveScene)
                     {
-                        scene = UnityEditor.SceneManagement.EditorSceneManager.OpenScene(
-                            scenePath,
-                            UnityEditor.SceneManagement.OpenSceneMode.Additive);
-                        openedByTool = true;
+                        scene = previousScene;
+                        if (!scene.IsValid())
+                        {
+                            errorMessage = "Active scene is not valid.";
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        scene = UnityEngine.SceneManagement.SceneManager.GetSceneByPath(scenePath);
+                        if (!scene.IsValid() || !scene.isLoaded)
+                        {
+                            scene = UnityEditor.SceneManagement.EditorSceneManager.OpenScene(
+                                scenePath,
+                                UnityEditor.SceneManagement.OpenSceneMode.Additive);
+                            openedByTool = true;
+                        }
+                    }
+
+                    resolvedScenePath = scene.path;
+                    resolvedSceneName = scene.name;
+                    var editKeyPath = string.IsNullOrWhiteSpace(scene.path)
+                        ? $"active:{scene.name}"
+                        : scene.path;
+                    editKey = BuildSceneEditKey(editKeyPath, edits);
+                    if (!string.IsNullOrWhiteSpace(editKey) && _agentSceneEditHistory.Contains(editKey))
+                    {
+                        summary = "Already attempted.";
+                        return;
                     }
                 }
                 catch (Exception ex)
@@ -2589,6 +2736,8 @@ namespace ProtoTipAI.Editor
 
                 var results = new List<string>();
                 var errors = new List<string>();
+                var deferred = new List<DeferredSceneEdit>();
+                var deferredAddComponentKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 UnityEngine.SceneManagement.SceneManager.SetActiveScene(scene);
 
                 try
@@ -2604,7 +2753,38 @@ namespace ProtoTipAI.Editor
                         }
                         else if (!string.IsNullOrWhiteSpace(editError))
                         {
-                            errors.Add(editError);
+                            if (ShouldDeferSceneEdit(edit, editError))
+                            {
+                                deferred.Add(new DeferredSceneEdit
+                                {
+                                    sceneKey = sceneKey,
+                                    edit = edit,
+                                    reason = editError
+                                });
+
+                                if (IsSceneEditType(edit, "set_component_field"))
+                                {
+                                    var addKey = BuildComponentEditKey(edit.name, edit.component);
+                                    if (!string.IsNullOrWhiteSpace(addKey) && deferredAddComponentKeys.Add(addKey))
+                                    {
+                                        deferred.Add(new DeferredSceneEdit
+                                        {
+                                            sceneKey = sceneKey,
+                                            edit = new ProtoSceneEditOperation
+                                            {
+                                                type = "add_component",
+                                                name = edit.name,
+                                                component = edit.component
+                                            },
+                                            reason = "Ensure component exists before setting fields."
+                                        });
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                errors.Add(editError);
+                            }
                         }
                     }
 
@@ -2615,7 +2795,10 @@ namespace ProtoTipAI.Editor
                     }
 
                     UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(scene);
-                    UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene);
+                    if (!string.IsNullOrWhiteSpace(scene.path))
+                    {
+                        UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene);
+                    }
                     summary = results.Count == 0 ? "No scene changes applied." : string.Join("; ", results);
                     if (invalidEdits > 0)
                     {
@@ -2624,6 +2807,12 @@ namespace ProtoTipAI.Editor
                     if (errors.Count > 0)
                     {
                         summary = $"{summary} (with {errors.Count} error(s)): {BuildSceneEditErrorSummary(errors)}";
+                    }
+                    if (deferred.Count > 0)
+                    {
+                        summary = $"{summary} (deferred {deferred.Count} edit(s) pending script compile)";
+                        _agentDeferredSceneEdits.AddRange(deferred);
+                        AppendAgentDebugLog("SceneEditDeferred", $"{deferred.Count} edit(s) queued");
                     }
 
                     var verifyMessage = string.Empty;
@@ -2661,7 +2850,7 @@ namespace ProtoTipAI.Editor
             }
 
             var relativePath = string.IsNullOrWhiteSpace(resolvedScenePath)
-                ? "Scene"
+                ? (string.IsNullOrWhiteSpace(resolvedSceneName) ? "Active Scene" : resolvedSceneName)
                 : BuildRelativePath(resolvedScenePath);
             var message = string.IsNullOrWhiteSpace(summary) ? "Scene edit complete." : summary;
             AppendAgentDebugLog("SceneEditSummary", message);
@@ -3141,6 +3330,24 @@ namespace ProtoTipAI.Editor
                    historyEntry.IndexOf("Already attempted", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    historyEntry.IndexOf("verified", StringComparison.OrdinalIgnoreCase) >= 0 ||
                    historyEntry.IndexOf("No scene changes applied", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool ShouldDeferSceneEdit(ProtoSceneEditOperation edit, string error)
+        {
+            if (edit == null || string.IsNullOrWhiteSpace(error))
+            {
+                return false;
+            }
+
+            var type = NormalizeAgentToken(edit.type);
+            if (type != "set_component_field" && type != "add_component")
+            {
+                return false;
+            }
+
+            return error.IndexOf("Field or property not found", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   error.IndexOf("Component type not found", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   error.IndexOf("Component not found", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static List<ProtoSceneEditOperation> CollectSceneEdits(ProtoAgentAction action)
@@ -5217,6 +5424,15 @@ namespace ProtoTipAI.Editor
             normalized = normalized.Replace('-', '_');
             normalized = Regex.Replace(normalized, "\\s+", "_");
             return normalized;
+        }
+
+        private static bool IsActiveSceneToken(string value)
+        {
+            var normalized = NormalizeAgentToken(value);
+            return string.IsNullOrWhiteSpace(normalized) ||
+                   normalized == "activescene" ||
+                   normalized == "active_scene" ||
+                   normalized == "active";
         }
 
         private static bool TryResolveAgentStage(string stage, out string label, out string[] types)
@@ -15534,6 +15750,13 @@ namespace ProtoTipAI.Editor
             public string target;
             public float[] vector;
             public float[] color;
+        }
+
+        private sealed class DeferredSceneEdit
+        {
+            public string sceneKey;
+            public ProtoSceneEditOperation edit;
+            public string reason;
         }
 
         private sealed class ProtoAgentCommandWindow : EditorWindow
