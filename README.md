@@ -63,7 +63,7 @@ If you want to collaborate, I will be really happy to hear from you (on this rep
 ## Demo Video
 
 Everything on this scene was created, placed, and configured by the plugin. It created the Player and objects scripts, added colliders and rigidbodies, and hydrated script values.  
-https://youtu.be/NM0tmGDOUYQ
+[![Everything on this scene was created, placed, and configured by the plugin. It created the Player and objects scripts, added colliders and rigidbodies, and hydrated script values.](https://img.youtube.com/vi/NM0tmGDOUYQ/0.jpg)](https://www.youtube.com/watch?v=NM0tmGDOUYQ)
 
 ## Agent Examples
 
