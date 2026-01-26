@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Globalization;
@@ -89,7 +90,6 @@ namespace ProtoTipAI.Editor
         private int _apiWaitTimeoutSeconds;
         private CancellationTokenSource _operationCts;
         private bool _isCanceling;
-        private bool _cancelRequested;
         private bool _isAutoRefreshDeferred;
         private ScriptContractIndex _scriptIndexCache;
         private bool _scriptIndexDirty = true;
@@ -110,10 +110,17 @@ namespace ProtoTipAI.Editor
         private static readonly char[] AgentSpinnerFrames = { '|', '/', '-', '\\' };
         private const int AgentMaxToolOutputChars = 2400;
         private const int AgentMaxHistoryEntries = 6;
+        private const int AgentDebugMaxChars = 12000;
+        private const int AgentDebugMessageChars = 2000;
         private readonly List<string> _agentHistory = new List<string>();
         private string _lastAgentGoal;
         private readonly Dictionary<string, AgentReadSnapshot> _agentReadMemory = new Dictionary<string, AgentReadSnapshot>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _agentToolCallHistory = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _agentSceneEditHistory = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Queue<ProtoAgentAction> _agentPendingActions = new Queue<ProtoAgentAction>();
+        private readonly object _agentDebugLock = new object();
+        private bool _agentDebugCaptureEnabled;
+        private string _agentDebugLogPath;
         private bool _chatHistoryDirty;
         private bool _chatHistorySaveQueued;
         private const int MaxChatHistoryMessages = 160;
@@ -181,6 +188,7 @@ namespace ProtoTipAI.Editor
         {
             RestorePlanFromDisk();
             RestoreChatHistoryFromDisk();
+            SyncAgentDebugCapture();
             _diagnostics = CollectDiagnostics();
             _lastDiagnosticsRefresh = EditorApplication.timeSinceStartup;
             CheckApiWaitTimeout(true);
@@ -200,6 +208,7 @@ namespace ProtoTipAI.Editor
         {
             CheckAgentLoopCompletion();
             CheckApiWaitTimeout(false);
+            SyncAgentDebugCapture();
             DrawHeader(true);
             DrawChatStatus();
             DrawChatHistory();
@@ -210,6 +219,7 @@ namespace ProtoTipAI.Editor
         {
             CheckAgentLoopCompletion();
             CheckApiWaitTimeout(false);
+            SyncAgentDebugCapture();
             DrawHeader(false);
             DrawSessionPanel();
             DrawContextOptions();
@@ -755,12 +765,12 @@ namespace ProtoTipAI.Editor
             }
         }
 
-        private async Task RunReadFileAsync(string absolutePath, string relativePath)
+        private Task RunReadFileAsync(string absolutePath, string relativePath)
         {
             if (!File.Exists(absolutePath))
             {
                 _toolExecutionStatus = $"File not found: {relativePath}.";
-                return;
+                return Task.CompletedTask;
             }
 
             string content;
@@ -771,12 +781,13 @@ namespace ProtoTipAI.Editor
             catch (Exception ex)
             {
                 _toolExecutionStatus = $"Unable to read file: {ex.Message}";
-                return;
+                return Task.CompletedTask;
             }
 
             var preview = content.Length > 4000 ? $"{content.Substring(0, 4000)}\n... (truncated)" : content;
             AppendToolMessage("Read File", relativePath, preview);
             _toolExecutionStatus = $"Read {relativePath} ({content.Length} chars).";
+            return Task.CompletedTask;
         }
 
         private async Task RunWriteFileAsync(string absolutePath, string relativePath)
@@ -1122,6 +1133,7 @@ namespace ProtoTipAI.Editor
             _toolStatus = string.Empty;
             ResetAgentStatus();
             EditorPrefs.SetString(SessionPrefsKey, _sessionId);
+            SyncAgentDebugCapture();
             Repaint();
         }
 
@@ -1516,6 +1528,7 @@ namespace ProtoTipAI.Editor
                 return;
             }
 
+            SyncAgentDebugCapture();
             _agentLoopTask = RunAgentLoopAsync(userGoal);
         }
 
@@ -1536,7 +1549,6 @@ namespace ProtoTipAI.Editor
                 return;
             }
 
-            _cancelRequested = true;
             if (_operationCts != null && !_operationCts.IsCancellationRequested)
             {
                 _operationCts.Cancel();
@@ -1576,7 +1588,6 @@ namespace ProtoTipAI.Editor
 
             _isSending = true;
             _status = "Sending message...";
-            _cancelRequested = false;
             var token = BeginOperation("chat");
             _apiWaitTimeoutSeconds = 320;
             AddChatMessage(new ProtoChatMessage { role = RoleUser, content = userText });
@@ -1634,17 +1645,18 @@ namespace ProtoTipAI.Editor
                 _agentHistory.Clear();
                 _agentReadMemory.Clear();
                 _agentToolCallHistory.Clear();
+                _agentSceneEditHistory.Clear();
             }
 
             ResetAgentStatus();
             _isAgentLoopActive = true;
             _status = "Agent loop running...";
-            _cancelRequested = false;
             var token = BeginOperation("agent loop");
             _apiWaitTimeoutSeconds = 320;
             var displayGoal = isContinuation && !string.Equals(trimmedGoal, effectiveGoal, StringComparison.OrdinalIgnoreCase)
                 ? $"Continue: {effectiveGoal}"
                 : trimmedGoal;
+            AppendAgentDebugLog("AgentLoopStart", $"session={_sessionId} goal={effectiveGoal} continuation={isContinuation}");
             AddChatMessage(new ProtoChatMessage { role = RoleUser, content = displayGoal });
             await MaybeCompactSessionAsync(token).ConfigureAwait(false);
             Repaint();
@@ -1664,14 +1676,25 @@ namespace ProtoTipAI.Editor
                         _toolStatus = $"Agent iteration {iteration + 1}/{_agentMaxIterations}...";
                         Repaint();
                     }).ConfigureAwait(false);
+                    AppendAgentDebugLog("AgentIterationStart", $"{iteration + 1}/{_agentMaxIterations}");
 
-                    var action = await RequestAgentActionAsync(effectiveGoal, iteration + 1, _agentMaxIterations, toolHistory, token).ConfigureAwait(false);
+                    ProtoAgentAction action;
+                    if (_agentPendingActions.Count > 0)
+                    {
+                        action = _agentPendingActions.Dequeue();
+                        AppendAgentDebugLog("AgentActionQueued", DescribeAgentAction(action));
+                    }
+                    else
+                    {
+                        action = await RequestAgentActionAsync(effectiveGoal, iteration + 1, _agentMaxIterations, toolHistory, token).ConfigureAwait(false);
+                    }
                     if (action == null || string.IsNullOrWhiteSpace(action.action))
                     {
                         await AppendAgentMessageAsync("Agent response was invalid. Stopping.").ConfigureAwait(false);
                         await RunOnMainThread(() => SetAgentOutcome("Invalid response", _agentLastIterations))
                             .ConfigureAwait(false);
                         completed = true;
+                        AppendAgentDebugLog("AgentLoopStop", "Invalid response");
                         break;
                     }
 
@@ -1682,6 +1705,12 @@ namespace ProtoTipAI.Editor
                         MarkChatHistoryDirty();
                     }
 
+                    var actionSummary = BuildAgentActionSummary(action, iteration + 1, _agentMaxIterations);
+                    if (!string.IsNullOrWhiteSpace(actionSummary))
+                    {
+                        await AppendAgentMessageAsync(actionSummary).ConfigureAwait(false);
+                    }
+
                     if (result.stop)
                     {
                         var outcome = string.IsNullOrWhiteSpace(result.outcomeLabel)
@@ -1690,6 +1719,7 @@ namespace ProtoTipAI.Editor
                         await RunOnMainThread(() => SetAgentOutcome(outcome, _agentLastIterations))
                             .ConfigureAwait(false);
                         completed = true;
+                        AppendAgentDebugLog("AgentLoopStop", $"stop={outcome}");
                         break;
                     }
                 }
@@ -1699,18 +1729,21 @@ namespace ProtoTipAI.Editor
                     await AppendAgentMessageAsync("Agent loop reached the max iteration limit. Type 'continue' to resume.").ConfigureAwait(false);
                     await RunOnMainThread(() => SetAgentOutcome("Reached iteration limit", _agentLastIterations))
                         .ConfigureAwait(false);
+                    AppendAgentDebugLog("AgentLoopStop", "Reached iteration limit");
                 }
             }
             catch (OperationCanceledException)
             {
                 await AppendAgentMessageAsync("Agent loop canceled.").ConfigureAwait(false);
                 await RunOnMainThread(() => SetAgentOutcome("Canceled", _agentLastIterations)).ConfigureAwait(false);
+                AppendAgentDebugLog("AgentLoopStop", "Canceled");
             }
             catch (Exception ex)
             {
                 await AppendAgentMessageAsync($"Agent loop error: {ex.Message}").ConfigureAwait(false);
                 await RunOnMainThread(() => SetAgentOutcome($"Error: {ex.Message}", _agentLastIterations))
                     .ConfigureAwait(false);
+                AppendAgentDebugLog("AgentLoopStop", $"Error: {ex.Message}");
             }
             finally
             {
@@ -1733,6 +1766,8 @@ namespace ProtoTipAI.Editor
             _agentLastIterations = 0;
             _agentLastOutcome = string.Empty;
             _agentLastOutcomeTime = string.Empty;
+            _agentSceneEditHistory.Clear();
+            _agentPendingActions.Clear();
         }
 
         private void SetAgentOutcome(string outcome, int iterations)
@@ -1741,6 +1776,232 @@ namespace ProtoTipAI.Editor
             _agentLastOutcome = clamped;
             _agentLastOutcomeTime = string.IsNullOrWhiteSpace(clamped) ? string.Empty : DateTime.Now.ToString("HH:mm:ss");
             _agentLastIterations = Mathf.Max(_agentLastIterations, iterations);
+            AppendAgentDebugLog("AgentOutcome", $"{clamped} (iterations={_agentLastIterations})");
+        }
+
+        private void SyncAgentDebugCapture()
+        {
+            var enabled = ProtoToolSettings.GetAgentDebugCapture();
+            if (enabled == _agentDebugCaptureEnabled && (!enabled || !string.IsNullOrWhiteSpace(_agentDebugLogPath)))
+            {
+                return;
+            }
+
+            RefreshAgentDebugCapture();
+        }
+
+        private void RefreshAgentDebugCapture()
+        {
+            var enabled = ProtoToolSettings.GetAgentDebugCapture();
+            _agentDebugCaptureEnabled = enabled;
+            if (!enabled)
+            {
+                _agentDebugLogPath = string.Empty;
+                return;
+            }
+
+            EnsureSessionId();
+            var assetPath = ProtoChatSessionStore.GetDebugLogPath(_sessionId);
+            _agentDebugLogPath = Path.GetFullPath(assetPath);
+        }
+
+        private void AppendAgentDebugLog(string label, string message)
+        {
+            if (!_agentDebugCaptureEnabled || string.IsNullOrWhiteSpace(_agentDebugLogPath))
+            {
+                return;
+            }
+
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
+            var safeLabel = string.IsNullOrWhiteSpace(label) ? "Debug" : label.Trim();
+            var payload = string.IsNullOrWhiteSpace(message) ? string.Empty : message.Trim();
+            payload = ClampToolOutput(payload, AgentDebugMaxChars);
+            var line = $"{timestamp} [{safeLabel}] {payload}{Environment.NewLine}";
+            lock (_agentDebugLock)
+            {
+                try
+                {
+                    File.AppendAllText(_agentDebugLogPath, line);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static string BuildAgentPromptDebug(
+            List<ProtoChatMessage> messages,
+            string goal,
+            int iteration,
+            int maxIterations)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine($"iteration={iteration}/{maxIterations}");
+            if (!string.IsNullOrWhiteSpace(goal))
+            {
+                builder.AppendLine($"goal={goal}");
+            }
+            builder.AppendLine($"messages={messages?.Count ?? 0}");
+            if (messages != null)
+            {
+                for (var i = 0; i < messages.Count; i++)
+                {
+                    var msg = messages[i];
+                    var role = msg?.role ?? "unknown";
+                    var content = msg?.content ?? string.Empty;
+                    content = ClampToolOutput(content, AgentDebugMessageChars);
+                    builder.Append(i + 1);
+                    builder.Append(". ");
+                    builder.Append(role);
+                    builder.Append(": ");
+                    builder.AppendLine(content);
+                }
+            }
+            return builder.ToString();
+        }
+
+        private static string BuildSceneEditDebug(string sceneKey, List<ProtoSceneEditOperation> edits)
+        {
+            var builder = new StringBuilder();
+            if (!string.IsNullOrWhiteSpace(sceneKey))
+            {
+                builder.AppendLine($"scene={sceneKey}");
+            }
+            builder.AppendLine($"edits={edits?.Count ?? 0}");
+            if (edits == null)
+            {
+                return builder.ToString();
+            }
+
+            for (var i = 0; i < edits.Count; i++)
+            {
+                var edit = edits[i];
+                if (edit == null)
+                {
+                    continue;
+                }
+
+                builder.Append("- type=");
+                builder.Append(edit.type ?? "null");
+                if (!string.IsNullOrWhiteSpace(edit.name))
+                {
+                    builder.Append(", name=");
+                    builder.Append(edit.name.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(edit.primitive))
+                {
+                    builder.Append(", primitive=");
+                    builder.Append(edit.primitive.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(edit.prefab))
+                {
+                    builder.Append(", prefab=");
+                    builder.Append(edit.prefab.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(edit.component))
+                {
+                    builder.Append(", component=");
+                    builder.Append(edit.component.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(edit.field))
+                {
+                    builder.Append(", field=");
+                    builder.Append(edit.field.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(edit.value))
+                {
+                    builder.Append(", value=");
+                    builder.Append(edit.value.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(edit.reference))
+                {
+                    builder.Append(", reference=");
+                    builder.Append(edit.reference.Trim());
+                }
+                if (edit.references != null && edit.references.Length > 0)
+                {
+                    builder.Append(", references=");
+                    builder.Append(string.Join(",", edit.references));
+                }
+                if (!string.IsNullOrWhiteSpace(edit.parent))
+                {
+                    builder.Append(", parent=");
+                    builder.Append(edit.parent.Trim());
+                }
+                if (!string.IsNullOrWhiteSpace(edit.target))
+                {
+                    builder.Append(", target=");
+                    builder.Append(edit.target.Trim());
+                }
+                builder.AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        private static string DescribeAgentAction(ProtoAgentAction action)
+        {
+            if (action == null)
+            {
+                return "null";
+            }
+
+            try
+            {
+                return JsonUtility.ToJson(action, false);
+            }
+            catch
+            {
+                return string.IsNullOrWhiteSpace(action.action) ? "unknown" : action.action.Trim();
+            }
+        }
+
+        private static string BuildAgentActionSummary(ProtoAgentAction action, int iteration, int maxIterations)
+        {
+            if (action == null || string.IsNullOrWhiteSpace(action.action))
+            {
+                return string.Empty;
+            }
+
+            var label = NormalizeAgentActionName(action.action);
+            var detail = string.Empty;
+            switch (label)
+            {
+                case "read_file":
+                case "write_file":
+                case "list_folder":
+                case "search_text":
+                    detail = action.path;
+                    break;
+                case "apply_plan":
+                    detail = "apply plan";
+                    break;
+                case "apply_stage":
+                    detail = string.IsNullOrWhiteSpace(action.stage) ? "apply stage" : $"apply stage {action.stage}";
+                    break;
+                case "fix_pass":
+                    detail = string.IsNullOrWhiteSpace(action.scope) ? "fix pass" : $"fix pass {action.scope}";
+                    break;
+                case "scene_edit":
+                    detail = string.IsNullOrWhiteSpace(action.scene) ? "scene edit" : $"scene edit {action.scene}";
+                    break;
+                case "respond":
+                    detail = "respond";
+                    break;
+                case "stop":
+                    detail = "stop";
+                    break;
+                default:
+                    detail = label;
+                    break;
+            }
+
+            if (!string.IsNullOrWhiteSpace(action.query))
+            {
+                detail = $"{detail} ({ClampStatusLine(action.query, 60)})";
+            }
+
+            return $"Agent step {iteration}/{maxIterations}: {detail}";
         }
 
         private async Task<ProtoAgentAction> RequestAgentActionAsync(
@@ -1803,9 +2064,12 @@ namespace ProtoTipAI.Editor
                 });
             }
 
+            AppendAgentDebugLog("AgentPrompt", BuildAgentPromptDebug(messages, userGoal, iteration, maxIterations));
+
             var settings = await RunOnMainThread(GetSettingsSnapshot).ConfigureAwait(false);
             if (settings == null || string.IsNullOrWhiteSpace(settings.ApiKey))
             {
+                AppendAgentDebugLog("AgentError", "Missing API key.");
                 return new ProtoAgentAction
                 {
                     action = "respond",
@@ -1820,11 +2084,16 @@ namespace ProtoTipAI.Editor
                 _apiWaitTimeoutSeconds,
                 token).ConfigureAwait(false);
             await RunOnMainThread(EndApiWait).ConfigureAwait(false);
+            AppendAgentDebugLog("AgentResponse", $"iteration={iteration}/{maxIterations}\n{ClampToolOutput(response, AgentDebugMaxChars)}");
 
-            if (TryParseAgentAction(response, out var action))
+            var actions = ParseAgentActionsFromResponse(response);
+            if (actions.Count > 0)
             {
-                return action;
+                EnqueueAgentActions(actions, 1);
+                AppendAgentDebugLog("AgentActionsQueued", $"count={Mathf.Max(0, actions.Count - 1)}");
+                return actions[0];
             }
+            AppendAgentDebugLog("AgentResponseInvalid", ClampToolOutput(response, AgentDebugMaxChars));
 
             var retryMessages = new List<ProtoChatMessage>(messages)
             {
@@ -1840,6 +2109,7 @@ namespace ProtoTipAI.Editor
                 }
             };
 
+            AppendAgentDebugLog("AgentPromptRetry", BuildAgentPromptDebug(retryMessages, userGoal, iteration, maxIterations));
             await RunOnMainThread(() => BeginApiWait($"agent retry {iteration}/{maxIterations}")).ConfigureAwait(false);
             var retryResponse = await ProtoProviderClient.SendChatAsync(
                 settings,
@@ -1847,61 +2117,91 @@ namespace ProtoTipAI.Editor
                 _apiWaitTimeoutSeconds,
                 token).ConfigureAwait(false);
             await RunOnMainThread(EndApiWait).ConfigureAwait(false);
+            AppendAgentDebugLog("AgentResponseRetry", $"iteration={iteration}/{maxIterations}\n{ClampToolOutput(retryResponse, AgentDebugMaxChars)}");
 
-            if (TryParseAgentAction(retryResponse, out var retryAction))
+            var retryActions = ParseAgentActionsFromResponse(retryResponse);
+            if (retryActions.Count > 0)
             {
-                return retryAction;
+                EnqueueAgentActions(retryActions, 1);
+                AppendAgentDebugLog("AgentActionsQueued", $"count={Mathf.Max(0, retryActions.Count - 1)}");
+                return retryActions[0];
             }
 
+            AppendAgentDebugLog("AgentResponseInvalid", ClampToolOutput(retryResponse, AgentDebugMaxChars));
             await AppendAgentMessageAsync($"Agent response invalid. Raw response:\n{ClampToolOutput(retryResponse, AgentMaxToolOutputChars)}")
                 .ConfigureAwait(false);
             return null;
         }
 
+        private void EnqueueAgentActions(List<ProtoAgentAction> actions, int startIndex)
+        {
+            if (actions == null || actions.Count <= startIndex)
+            {
+                return;
+            }
+
+            for (var i = startIndex; i < actions.Count; i++)
+            {
+                var action = actions[i];
+                if (action == null || string.IsNullOrWhiteSpace(action.action))
+                {
+                    continue;
+                }
+
+                _agentPendingActions.Enqueue(action);
+            }
+        }
+
         private async Task<AgentActionResult> ExecuteAgentActionAsync(ProtoAgentAction action, CancellationToken token)
         {
+            AppendAgentDebugLog("AgentAction", DescribeAgentAction(action));
             var actionName = NormalizeAgentActionName(action.action);
             switch (actionName)
             {
                 case "read_file":
-                    return new AgentActionResult
                     {
-                        historyEntry = await AgentReadFileAsync(action, token).ConfigureAwait(false)
-                    };
+                        var history = await AgentReadFileAsync(action, token).ConfigureAwait(false);
+                        AppendAgentDebugLog("AgentResult", history);
+                        return new AgentActionResult { historyEntry = history };
+                    }
                 case "write_file":
-                    return new AgentActionResult
                     {
-                        historyEntry = await AgentWriteFileAsync(action.path, action.content, token).ConfigureAwait(false)
-                    };
+                        var history = await AgentWriteFileAsync(action.path, action.content, token).ConfigureAwait(false);
+                        AppendAgentDebugLog("AgentResult", history);
+                        return new AgentActionResult { historyEntry = history };
+                    }
                 case "list_folder":
-                    return new AgentActionResult
                     {
-                        historyEntry = await AgentListFolderAsync(action.path, token).ConfigureAwait(false)
-                    };
+                        var history = await AgentListFolderAsync(action.path, token).ConfigureAwait(false);
+                        AppendAgentDebugLog("AgentResult", history);
+                        return new AgentActionResult { historyEntry = history };
+                    }
                 case "search_text":
-                    return new AgentActionResult
                     {
-                        historyEntry = await AgentSearchTextAsync(action.path, action.query, token).ConfigureAwait(false)
-                    };
+                        var history = await AgentSearchTextAsync(action.path, action.query, token).ConfigureAwait(false);
+                        AppendAgentDebugLog("AgentResult", history);
+                        return new AgentActionResult { historyEntry = history };
+                    }
                 case "apply_plan":
                     await ApplyPlanInternalAsync(token, false).ConfigureAwait(false);
-                    return new AgentActionResult
                     {
-                        historyEntry = BuildAgentStatusHistory("Apply Plan", _toolStatus)
-                    };
+                        var history = BuildAgentStatusHistory("Apply Plan", _toolStatus);
+                        AppendAgentDebugLog("AgentResult", history);
+                        return new AgentActionResult { historyEntry = history };
+                    }
                 case "apply_stage":
                     if (!TryResolveAgentStage(action.stage, out var label, out var types))
                     {
-                        return new AgentActionResult
-                        {
-                            historyEntry = BuildAgentErrorHistory("Apply Stage", $"Unknown stage \"{action.stage}\".")
-                        };
+                        var error = BuildAgentErrorHistory("Apply Stage", $"Unknown stage \"{action.stage}\".");
+                        AppendAgentDebugLog("AgentResult", error);
+                        return new AgentActionResult { historyEntry = error };
                     }
                     await ApplyPlanStageInternalAsync(label, types, token, false).ConfigureAwait(false);
-                    return new AgentActionResult
                     {
-                        historyEntry = BuildAgentStatusHistory($"Apply Stage ({label})", _toolStatus)
-                    };
+                        var history = BuildAgentStatusHistory($"Apply Stage ({label})", _toolStatus);
+                        AppendAgentDebugLog("AgentResult", history);
+                        return new AgentActionResult { historyEntry = history };
+                    }
                 case "fix_pass":
                     var scope = NormalizeAgentToken(action.scope);
                     HashSet<string> targets = null;
@@ -1922,20 +2222,32 @@ namespace ProtoTipAI.Editor
                     }
                     else if (!string.IsNullOrWhiteSpace(scope))
                     {
-                        return new AgentActionResult
-                        {
-                            historyEntry = BuildAgentErrorHistory("Fix Pass", $"Unknown scope \"{action.scope}\".")
-                        };
+                        var error = BuildAgentErrorHistory("Fix Pass", $"Unknown scope \"{action.scope}\".");
+                        AppendAgentDebugLog("AgentResult", error);
+                        return new AgentActionResult { historyEntry = error };
                     }
                     await RunFixPassInternalAsync(targets, passLabel, token, false).ConfigureAwait(false);
-                    return new AgentActionResult
                     {
-                        historyEntry = BuildAgentStatusHistory("Fix Pass", _toolStatus)
-                    };
+                        var history = BuildAgentStatusHistory("Fix Pass", _toolStatus);
+                        AppendAgentDebugLog("AgentResult", history);
+                        return new AgentActionResult { historyEntry = history };
+                    }
                 case "scene_edit":
+                    var sceneHistory = await AgentEditSceneAsync(action, token).ConfigureAwait(false);
+                    if (IsSceneEditNoOp(sceneHistory))
+                    {
+                        AppendAgentDebugLog("AgentResult", sceneHistory);
+                        return new AgentActionResult
+                        {
+                            historyEntry = sceneHistory,
+                            stop = true,
+                            outcomeLabel = "No further scene changes"
+                        };
+                    }
+                    AppendAgentDebugLog("AgentResult", sceneHistory);
                     return new AgentActionResult
                     {
-                        historyEntry = await AgentEditSceneAsync(action, token).ConfigureAwait(false)
+                        historyEntry = sceneHistory
                     };
                 case "respond":
                     if (AgentResponseRequestsUserInput(action.message))
@@ -1944,6 +2256,7 @@ namespace ProtoTipAI.Editor
                             ? "Agent needs more context to continue."
                             : action.message.Trim();
                         await AppendAgentMessageAsync(needsContext).ConfigureAwait(false);
+                        AppendAgentDebugLog("AgentResult", $"respond_needs_input: {needsContext}");
                         return new AgentActionResult { stop = true, outcomeLabel = "Needs input" };
                     }
                     var response = string.IsNullOrWhiteSpace(action.message) ? "Done." : action.message.Trim();
@@ -1951,13 +2264,16 @@ namespace ProtoTipAI.Editor
                     var outcome = string.Equals(response, "Missing API key.", StringComparison.OrdinalIgnoreCase)
                         ? response
                         : "Completed";
+                    AppendAgentDebugLog("AgentResult", $"respond: {response}");
                     return new AgentActionResult { stop = true, outcomeLabel = outcome };
                 case "stop":
                     await AppendAgentMessageAsync("Agent stopped.").ConfigureAwait(false);
+                    AppendAgentDebugLog("AgentResult", "stop");
                     return new AgentActionResult { stop = true, outcomeLabel = "Stopped by agent" };
                 default:
                     await AppendAgentMessageAsync($"Agent returned unknown action: {action.action}.").ConfigureAwait(false);
                     var actionLabel = string.IsNullOrWhiteSpace(action.action) ? "Unknown action" : $"Unknown action: {action.action}";
+                    AppendAgentDebugLog("AgentResult", actionLabel);
                     return new AgentActionResult { stop = true, outcomeLabel = actionLabel };
             }
         }
@@ -2182,12 +2498,18 @@ namespace ProtoTipAI.Editor
             }
 
             var edits = CollectSceneEdits(action);
+            var invalidEdits = FilterInvalidSceneEdits(edits);
             if (edits.Count == 0)
             {
-                return BuildAgentErrorHistory("Scene Edit", "No edits provided.");
+                var editError = invalidEdits > 0
+                    ? "All edits were missing a valid type."
+                    : "No edits provided.";
+                AppendAgentDebugLog("SceneEditError", editError);
+                return BuildAgentErrorHistory("Scene Edit", editError);
             }
 
             var sceneKey = string.IsNullOrWhiteSpace(action.scene) ? action.path : action.scene;
+            AppendAgentDebugLog("SceneEditRequest", BuildSceneEditDebug(sceneKey, edits));
             var shouldApply = await RunOnMainThread(() =>
             {
                 if (ProtoToolSettings.GetAutoConfirm() || ProtoToolSettings.GetFullAgentMode())
@@ -2210,7 +2532,8 @@ namespace ProtoTipAI.Editor
 
             string resolvedScenePath = null;
             string summary = null;
-            string error = null;
+            string errorMessage = null;
+            string editKey = null;
 
             await RunOnMainThread(() =>
             {
@@ -2226,15 +2549,21 @@ namespace ProtoTipAI.Editor
                 var scenePath = ResolveScenePathForAgent(sceneKey);
                 if (string.IsNullOrWhiteSpace(scenePath))
                 {
-                    error = "Scene not found. Provide a scene name or path.";
+                    errorMessage = "Scene not found. Provide a scene name or path.";
                     return;
                 }
 
                 resolvedScenePath = scenePath;
+                editKey = BuildSceneEditKey(scenePath, edits);
+                if (!string.IsNullOrWhiteSpace(editKey) && _agentSceneEditHistory.Contains(editKey))
+                {
+                    summary = "Already attempted.";
+                    return;
+                }
 
                 if (!EnsureAdditiveSceneCreationPossible(out var setupError))
                 {
-                    error = setupError;
+                    errorMessage = setupError;
                     return;
                 }
 
@@ -2254,7 +2583,7 @@ namespace ProtoTipAI.Editor
                 }
                 catch (Exception ex)
                 {
-                    error = $"Failed to open scene: {ex.Message}";
+                    errorMessage = $"Failed to open scene: {ex.Message}";
                     return;
                 }
 
@@ -2281,16 +2610,34 @@ namespace ProtoTipAI.Editor
 
                     if (results.Count == 0 && errors.Count > 0)
                     {
-                        error = string.Join("\n", errors);
+                        errorMessage = string.Join("\n", errors);
                         return;
                     }
 
                     UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(scene);
                     UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene);
                     summary = results.Count == 0 ? "No scene changes applied." : string.Join("; ", results);
+                    if (invalidEdits > 0)
+                    {
+                        summary = $"{summary} (skipped {invalidEdits} invalid edit(s))";
+                    }
                     if (errors.Count > 0)
                     {
-                        summary = $"{summary} (with {errors.Count} error(s))";
+                        summary = $"{summary} (with {errors.Count} error(s)): {BuildSceneEditErrorSummary(errors)}";
+                    }
+
+                    var verifyMessage = string.Empty;
+                    if (TryVerifySceneEdits(scene, edits, out verifyMessage))
+                    {
+                        summary = $"{summary} (verified)";
+                    }
+                    else if (!string.IsNullOrWhiteSpace(verifyMessage))
+                    {
+                        summary = $"{summary} ({verifyMessage})";
+                    }
+                    if (!string.IsNullOrWhiteSpace(editKey))
+                    {
+                        _agentSceneEditHistory.Add(editKey);
                     }
                 }
                 finally
@@ -2307,17 +2654,493 @@ namespace ProtoTipAI.Editor
                 }
             }).ConfigureAwait(false);
 
-            if (!string.IsNullOrWhiteSpace(error))
+            if (!string.IsNullOrWhiteSpace(errorMessage))
             {
-                return BuildAgentErrorHistory("Scene Edit", error);
+                AppendAgentDebugLog("SceneEditError", errorMessage);
+                return BuildAgentErrorHistory("Scene Edit", errorMessage);
             }
 
             var relativePath = string.IsNullOrWhiteSpace(resolvedScenePath)
                 ? "Scene"
                 : BuildRelativePath(resolvedScenePath);
             var message = string.IsNullOrWhiteSpace(summary) ? "Scene edit complete." : summary;
+            AppendAgentDebugLog("SceneEditSummary", message);
             await RunOnMainThread(() => AppendToolMessage("Scene Edit", relativePath, message)).ConfigureAwait(false);
             return BuildAgentToolHistoryEntry("Scene Edit", relativePath, ClampToolOutput(message, AgentMaxToolOutputChars));
+        }
+
+        private static string BuildSceneEditErrorSummary(List<string> errors)
+        {
+            if (errors == null || errors.Count == 0)
+            {
+                return "unknown error";
+            }
+
+            var count = Math.Min(2, errors.Count);
+            var builder = new StringBuilder();
+            for (var i = 0; i < count; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(" | ");
+                }
+                builder.Append(errors[i].Trim());
+            }
+
+            if (errors.Count > count)
+            {
+                builder.Append(" | ...");
+            }
+
+            return builder.ToString();
+        }
+
+        private static int FilterInvalidSceneEdits(List<ProtoSceneEditOperation> edits)
+        {
+            if (edits == null || edits.Count == 0)
+            {
+                return 0;
+            }
+
+            var removed = edits.RemoveAll(edit => edit == null || string.IsNullOrWhiteSpace(edit.type));
+            return removed;
+        }
+
+        private static bool TryVerifySceneEdits(
+            UnityEngine.SceneManagement.Scene scene,
+            List<ProtoSceneEditOperation> edits,
+            out string message)
+        {
+            message = string.Empty;
+            if (!scene.IsValid() || edits == null || edits.Count == 0)
+            {
+                return false;
+            }
+
+            var failures = new List<string>();
+            for (var i = 0; i < edits.Count; i++)
+            {
+                var edit = edits[i];
+                if (edit == null)
+                {
+                    continue;
+                }
+
+                if (!IsSceneEditSatisfied(scene, edit, out var detail))
+                {
+                    if (!string.IsNullOrWhiteSpace(detail))
+                    {
+                        failures.Add(detail);
+                    }
+                }
+            }
+
+            if (failures.Count == 0)
+            {
+                message = "verified";
+                return true;
+            }
+
+            message = $"verification failed: {BuildSceneEditErrorSummary(failures)}";
+            return false;
+        }
+
+        private static bool IsSceneEditSatisfied(
+            UnityEngine.SceneManagement.Scene scene,
+            ProtoSceneEditOperation edit,
+            out string detail)
+        {
+            detail = string.Empty;
+            if (edit == null || string.IsNullOrWhiteSpace(edit.type))
+            {
+                return true;
+            }
+
+            var type = NormalizeAgentToken(edit.type);
+            switch (type)
+            {
+                case "add_gameobject":
+                {
+                    var name = string.IsNullOrWhiteSpace(edit.name) ? "GameObject" : edit.name.Trim();
+                    var obj = FindInSceneByName(scene, name);
+                    if (obj == null)
+                    {
+                        detail = $"missing {name}";
+                        return false;
+                    }
+                    return true;
+                }
+                case "add_prefab":
+                {
+                    var name = string.IsNullOrWhiteSpace(edit.name) ? string.Empty : edit.name.Trim();
+                    if (string.IsNullOrWhiteSpace(name))
+                    {
+                        if (TryResolvePrefabAsset(edit.prefab ?? string.Empty, out var prefab, out _, out _))
+                        {
+                            name = prefab != null ? prefab.name : string.Empty;
+                        }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(name))
+                    {
+                        detail = "prefab instance not resolved";
+                        return false;
+                    }
+
+                    var obj = FindInSceneByName(scene, name);
+                    if (obj == null)
+                    {
+                        detail = $"missing {name}";
+                        return false;
+                    }
+                    return true;
+                }
+                case "add_component":
+                {
+                    if (string.IsNullOrWhiteSpace(edit.name))
+                    {
+                        return true;
+                    }
+
+                    var target = FindInSceneByName(scene, edit.name.Trim());
+                    if (target == null)
+                    {
+                        detail = $"missing {edit.name.Trim()}";
+                        return false;
+                    }
+
+                    if (!TryResolveComponentType(edit.component ?? string.Empty, out var componentType, out _))
+                    {
+                        detail = $"component not found: {edit.component}";
+                        return false;
+                    }
+
+                    return target.GetComponent(componentType) != null;
+                }
+                case "set_component_field":
+                {
+                    if (string.IsNullOrWhiteSpace(edit.name))
+                    {
+                        return true;
+                    }
+
+                    var target = FindInSceneByName(scene, edit.name.Trim());
+                    if (target == null)
+                    {
+                        detail = $"missing {edit.name.Trim()}";
+                        return false;
+                    }
+
+                    if (!TryResolveComponentType(edit.component ?? string.Empty, out var componentType, out _))
+                    {
+                        detail = $"component not found: {edit.component}";
+                        return false;
+                    }
+
+                    var component = target.GetComponent(componentType);
+                    if (component == null)
+                    {
+                        detail = $"missing component {componentType.Name}";
+                        return false;
+                    }
+
+                    if (!TryResolveFieldOrProperty(componentType, edit.field ?? string.Empty, out var field, out var property))
+                    {
+                        detail = $"missing field {edit.field}";
+                        return false;
+                    }
+
+                    if (!TryConvertSceneFieldValue(field != null ? field.FieldType : property.PropertyType, edit, scene, out var expected, out _))
+                    {
+                        detail = $"invalid value for {edit.field}";
+                        return false;
+                    }
+
+                    var actual = field != null ? field.GetValue(component) : property.GetValue(component);
+                    if (!AreSceneFieldValuesEqual(expected, actual))
+                    {
+                        detail = $"{edit.field} not set";
+                        return false;
+                    }
+
+                    return true;
+                }
+                case "set_transform":
+                {
+                    if (string.IsNullOrWhiteSpace(edit.name))
+                    {
+                        return true;
+                    }
+
+                    var target = FindInSceneByName(scene, edit.name.Trim());
+                    if (target == null)
+                    {
+                        detail = $"missing {edit.name.Trim()}";
+                        return false;
+                    }
+
+                    if (TryParseVector3(edit.position, out var position) &&
+                        Vector3.Distance(target.transform.position, position) > 0.01f)
+                    {
+                        detail = $"{edit.name} position mismatch";
+                        return false;
+                    }
+
+                    if (TryParseVector3(edit.rotation, out var rotation))
+                    {
+                        var angle = Quaternion.Angle(target.transform.rotation, Quaternion.Euler(rotation));
+                        if (angle > 1f)
+                        {
+                            detail = $"{edit.name} rotation mismatch";
+                            return false;
+                        }
+                    }
+
+                    if (TryParseVector3(edit.scale, out var scale) &&
+                        Vector3.Distance(target.transform.localScale, scale) > 0.01f)
+                    {
+                        detail = $"{edit.name} scale mismatch";
+                        return false;
+                    }
+
+                    return true;
+                }
+                case "set_light":
+                case "add_light":
+                {
+                    var name = string.IsNullOrWhiteSpace(edit.name) ? "SceneLight" : edit.name.Trim();
+                    var target = FindInSceneByName(scene, name);
+                    if (target == null)
+                    {
+                        detail = $"missing {name}";
+                        return false;
+                    }
+
+                    var light = target.GetComponent<Light>();
+                    if (light == null)
+                    {
+                        detail = $"missing light on {name}";
+                        return false;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(edit.lightType) &&
+                        light.type != ParseLightType(edit.lightType, light.type))
+                    {
+                        detail = $"{name} light type mismatch";
+                        return false;
+                    }
+
+                    if (edit.intensity > 0f && Mathf.Abs(light.intensity - edit.intensity) > 0.01f)
+                    {
+                        detail = $"{name} intensity mismatch";
+                        return false;
+                    }
+
+                    if (edit.range > 0f && Mathf.Abs(light.range - edit.range) > 0.01f)
+                    {
+                        detail = $"{name} range mismatch";
+                        return false;
+                    }
+
+                    if (edit.spotAngle > 0f && Mathf.Abs(light.spotAngle - edit.spotAngle) > 0.1f)
+                    {
+                        detail = $"{name} spotAngle mismatch";
+                        return false;
+                    }
+
+                    if (TryParseColor(edit.color, out var color) &&
+                        Vector4.Distance(new Vector4(light.color.r, light.color.g, light.color.b, light.color.a),
+                                         new Vector4(color.r, color.g, color.b, color.a)) > 0.02f)
+                    {
+                        detail = $"{name} color mismatch";
+                        return false;
+                    }
+
+                    return true;
+                }
+                case "delete_object":
+                {
+                    if (string.IsNullOrWhiteSpace(edit.name))
+                    {
+                        return true;
+                    }
+
+                    var target = FindInSceneByName(scene, edit.name.Trim());
+                    if (target != null)
+                    {
+                        detail = $"{edit.name.Trim()} still exists";
+                        return false;
+                    }
+                    return true;
+                }
+                default:
+                    return true;
+            }
+        }
+
+        private static bool AreSceneFieldValuesEqual(object expected, object actual)
+        {
+            if (ReferenceEquals(expected, actual))
+            {
+                return true;
+            }
+
+            if (expected == null || actual == null)
+            {
+                return false;
+            }
+
+            if (expected is float expectedFloat && actual is float actualFloat)
+            {
+                return Mathf.Abs(expectedFloat - actualFloat) <= 0.01f;
+            }
+
+            if (expected is double expectedDouble && actual is double actualDouble)
+            {
+                return Math.Abs(expectedDouble - actualDouble) <= 0.01;
+            }
+
+            if (expected is Vector3 expectedVector3 && actual is Vector3 actualVector3)
+            {
+                return Vector3.Distance(expectedVector3, actualVector3) <= 0.01f;
+            }
+
+            if (expected is Vector2 expectedVector2 && actual is Vector2 actualVector2)
+            {
+                return Vector2.Distance(expectedVector2, actualVector2) <= 0.01f;
+            }
+
+            if (expected is Color expectedColor && actual is Color actualColor)
+            {
+                return Mathf.Abs(expectedColor.r - actualColor.r) <= 0.01f &&
+                       Mathf.Abs(expectedColor.g - actualColor.g) <= 0.01f &&
+                       Mathf.Abs(expectedColor.b - actualColor.b) <= 0.01f &&
+                       Mathf.Abs(expectedColor.a - actualColor.a) <= 0.01f;
+            }
+
+            if (expected is UnityEngine.Object expectedObj && actual is UnityEngine.Object actualObj)
+            {
+                return expectedObj == actualObj;
+            }
+
+            return expected.Equals(actual);
+        }
+
+        private static string BuildSceneEditKey(string scenePath, List<ProtoSceneEditOperation> edits)
+        {
+            if (string.IsNullOrWhiteSpace(scenePath) || edits == null || edits.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var builder = new StringBuilder(scenePath.Trim().ToLowerInvariant());
+            for (var i = 0; i < edits.Count; i++)
+            {
+                var edit = edits[i];
+                if (edit == null)
+                {
+                    continue;
+                }
+
+                builder.Append("|");
+                builder.Append(NormalizeAgentToken(edit.type));
+                builder.Append("|");
+                builder.Append(edit.name?.Trim());
+                builder.Append("|");
+                builder.Append(edit.primitive?.Trim());
+                builder.Append("|");
+                builder.Append(edit.parent?.Trim());
+                builder.Append("|");
+                builder.Append(edit.prefab?.Trim());
+                builder.Append("|");
+                builder.Append(edit.component?.Trim());
+                builder.Append("|");
+                builder.Append(edit.field?.Trim());
+                builder.Append("|");
+                builder.Append(edit.value?.Trim());
+                builder.Append("|");
+                builder.Append(edit.reference?.Trim());
+                builder.Append("|");
+                AppendStringArray(builder, edit.references);
+                builder.Append("|");
+                builder.Append(edit.lightType?.Trim());
+                builder.Append("|");
+                AppendFloat(builder, edit.intensity);
+                builder.Append("|");
+                AppendFloat(builder, edit.range);
+                builder.Append("|");
+                AppendFloat(builder, edit.spotAngle);
+                builder.Append("|");
+                AppendFloatArray(builder, edit.position);
+                builder.Append("|");
+                AppendFloatArray(builder, edit.rotation);
+                builder.Append("|");
+                AppendFloatArray(builder, edit.scale);
+                builder.Append("|");
+                AppendFloatArray(builder, edit.offset);
+                builder.Append("|");
+                builder.Append(edit.target?.Trim());
+                builder.Append("|");
+                AppendFloatArray(builder, edit.vector);
+                builder.Append("|");
+                AppendFloatArray(builder, edit.color);
+            }
+
+            return builder.ToString();
+        }
+
+        private static void AppendFloatArray(StringBuilder builder, float[] values)
+        {
+            if (values == null || values.Length == 0)
+            {
+                builder.Append("-");
+                return;
+            }
+
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(",");
+                }
+                builder.Append(values[i].ToString("0.###", CultureInfo.InvariantCulture));
+            }
+        }
+
+        private static void AppendStringArray(StringBuilder builder, string[] values)
+        {
+            if (values == null || values.Length == 0)
+            {
+                builder.Append("-");
+                return;
+            }
+
+            for (var i = 0; i < values.Length; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(",");
+                }
+                builder.Append(values[i]?.Trim());
+            }
+        }
+
+        private static void AppendFloat(StringBuilder builder, float value)
+        {
+            builder.Append(value.ToString("0.###", CultureInfo.InvariantCulture));
+        }
+
+        private static bool IsSceneEditNoOp(string historyEntry)
+        {
+            if (string.IsNullOrWhiteSpace(historyEntry))
+            {
+                return false;
+            }
+
+            return historyEntry.IndexOf("Already applied", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   historyEntry.IndexOf("Already attempted", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   historyEntry.IndexOf("verified", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   historyEntry.IndexOf("No scene changes applied", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static List<ProtoSceneEditOperation> CollectSceneEdits(ProtoAgentAction action)
@@ -2537,8 +3360,34 @@ namespace ProtoTipAI.Editor
         {
             result = string.Empty;
             error = string.Empty;
-            var name = string.IsNullOrWhiteSpace(edit.name) ? "GameObject" : edit.name.Trim();
-            var go = new GameObject(name);
+            var rawName = string.IsNullOrWhiteSpace(edit.name) ? string.Empty : edit.name.Trim();
+            var primitiveToken = string.IsNullOrWhiteSpace(edit.primitive) ? string.Empty : edit.primitive.Trim();
+            GameObject go;
+            string name;
+
+            if (!string.IsNullOrWhiteSpace(primitiveToken))
+            {
+                if (!TryParsePrimitiveType(primitiveToken, out var primitiveType))
+                {
+                    error = $"Unknown primitive type: {primitiveToken}.";
+                    return false;
+                }
+
+                go = GameObject.CreatePrimitive(primitiveType);
+                if (!string.IsNullOrWhiteSpace(rawName))
+                {
+                    go.name = rawName;
+                }
+
+                name = go.name;
+                AssignSceneParent(go, scene, edit.parent);
+                ApplyTransformEdits(go.transform, edit, scene);
+                result = $"add_gameobject {name} ({primitiveType})";
+                return true;
+            }
+
+            name = string.IsNullOrWhiteSpace(rawName) ? "GameObject" : rawName;
+            go = new GameObject(name);
             AssignSceneParent(go, scene, edit.parent);
             ApplyTransformEdits(go.transform, edit, scene);
             result = $"add_gameobject {name}";
@@ -2985,6 +3834,51 @@ namespace ProtoTipAI.Editor
             return fallback;
         }
 
+        private static bool TryParsePrimitiveType(string value, out PrimitiveType primitiveType)
+        {
+            primitiveType = PrimitiveType.Cube;
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            var normalized = NormalizeAgentToken(value);
+            switch (normalized)
+            {
+                case "cube":
+                case "box":
+                case "cubo":
+                case "caja":
+                    primitiveType = PrimitiveType.Cube;
+                    return true;
+                case "sphere":
+                case "ball":
+                case "esfera":
+                case "bola":
+                    primitiveType = PrimitiveType.Sphere;
+                    return true;
+                case "capsule":
+                case "capsula":
+                    primitiveType = PrimitiveType.Capsule;
+                    return true;
+                case "cylinder":
+                case "cilindro":
+                    primitiveType = PrimitiveType.Cylinder;
+                    return true;
+                case "plane":
+                case "plano":
+                    primitiveType = PrimitiveType.Plane;
+                    return true;
+                case "quad":
+                case "square":
+                case "cuadrado":
+                    primitiveType = PrimitiveType.Quad;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         private static bool TryResolvePrefabAsset(
             string prefabToken,
             out GameObject prefab,
@@ -3255,6 +4149,48 @@ namespace ProtoTipAI.Editor
                 return false;
             }
 
+            Type listElementType = null;
+            if (fieldType.IsArray || TryGetListElementType(fieldType, out listElementType))
+            {
+                var elementType = fieldType.IsArray ? fieldType.GetElementType() : listElementType;
+                if (elementType == null)
+                {
+                    error = "Array element type is missing.";
+                    return false;
+                }
+
+                if (!TryGetReferenceNames(edit, out var references))
+                {
+                    error = "Reference list is missing.";
+                    return false;
+                }
+
+                if (!TryBuildReferenceCollection(elementType, references, scene, out var collection, out var collectionError))
+                {
+                    error = collectionError;
+                    return false;
+                }
+
+                if (fieldType.IsArray)
+                {
+                    var array = Array.CreateInstance(elementType, collection.Count);
+                    for (var i = 0; i < collection.Count; i++)
+                    {
+                        array.SetValue(collection[i], i);
+                    }
+                    value = array;
+                    return true;
+                }
+
+                var listInstance = (IList)Activator.CreateInstance(fieldType);
+                foreach (var item in collection)
+                {
+                    listInstance.Add(item);
+                }
+                value = listInstance;
+                return true;
+            }
+
             if (typeof(GameObject).IsAssignableFrom(fieldType))
             {
                 if (TryResolveSceneObject(reference, scene, out var obj))
@@ -3309,6 +4245,147 @@ namespace ProtoTipAI.Editor
             }
 
             error = $"Unsupported field type: {fieldType.Name}.";
+            return false;
+        }
+
+        private static bool TryGetListElementType(Type fieldType, out Type elementType)
+        {
+            elementType = null;
+            if (fieldType == null)
+            {
+                return false;
+            }
+
+            if (fieldType.IsGenericType && fieldType.GetGenericTypeDefinition() == typeof(List<>))
+            {
+                elementType = fieldType.GetGenericArguments()[0];
+                return elementType != null;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetReferenceNames(ProtoSceneEditOperation edit, out List<string> references)
+        {
+            references = new List<string>();
+            if (edit == null)
+            {
+                return false;
+            }
+
+            if (edit.references != null && edit.references.Length > 0)
+            {
+                foreach (var entry in edit.references)
+                {
+                    var trimmed = entry?.Trim();
+                    if (!string.IsNullOrWhiteSpace(trimmed))
+                    {
+                        references.Add(trimmed);
+                    }
+                }
+            }
+
+            if (references.Count == 0 && !string.IsNullOrWhiteSpace(edit.reference))
+            {
+                var parts = edit.reference.Split(new[] { ',', ';', '|' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var part in parts)
+                {
+                    var trimmed = part.Trim();
+                    if (!string.IsNullOrWhiteSpace(trimmed))
+                    {
+                        references.Add(trimmed);
+                    }
+                }
+            }
+
+            return references.Count > 0;
+        }
+
+        private static bool TryBuildReferenceCollection(
+            Type elementType,
+            List<string> references,
+            UnityEngine.SceneManagement.Scene scene,
+            out List<object> collection,
+            out string error)
+        {
+            collection = new List<object>();
+            error = string.Empty;
+            if (elementType == null)
+            {
+                error = "Reference element type is missing.";
+                return false;
+            }
+
+            if (references == null || references.Count == 0)
+            {
+                error = "Reference list is empty.";
+                return false;
+            }
+
+            if (typeof(Transform).IsAssignableFrom(elementType))
+            {
+                foreach (var name in references)
+                {
+                    if (!TryResolveSceneObject(name, scene, out var obj))
+                    {
+                        error = $"Transform not found: {name}.";
+                        return false;
+                    }
+                    collection.Add(obj.transform);
+                }
+                return true;
+            }
+
+            if (typeof(GameObject).IsAssignableFrom(elementType))
+            {
+                foreach (var name in references)
+                {
+                    if (!TryResolveSceneObject(name, scene, out var obj))
+                    {
+                        error = $"GameObject not found: {name}.";
+                        return false;
+                    }
+                    collection.Add(obj);
+                }
+                return true;
+            }
+
+            if (typeof(Component).IsAssignableFrom(elementType))
+            {
+                foreach (var name in references)
+                {
+                    if (!TryResolveSceneComponent(elementType, name, scene, out var component))
+                    {
+                        error = $"Component not found: {name}.";
+                        return false;
+                    }
+                    collection.Add(component);
+                }
+                return true;
+            }
+
+            if (typeof(UnityEngine.Object).IsAssignableFrom(elementType))
+            {
+                foreach (var name in references)
+                {
+                    if (!string.IsNullOrWhiteSpace(name) &&
+                        name.Trim().StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var asset = AssetDatabase.LoadAssetAtPath(name.Trim(), elementType);
+                        if (asset != null)
+                        {
+                            collection.Add(asset);
+                            continue;
+                        }
+                    }
+
+                    error = $"Unsupported object reference value: {name}.";
+                    return false;
+                }
+                return true;
+            }
+
+            error = $"Unsupported array/list element type: {elementType.Name}.";
             return false;
         }
 
@@ -3497,33 +4574,87 @@ namespace ProtoTipAI.Editor
         private static bool TryParseAgentAction(string response, out ProtoAgentAction action)
         {
             action = null;
-            if (string.IsNullOrWhiteSpace(response))
+            var actions = ParseAgentActionsFromResponse(response);
+            if (actions.Count == 0)
             {
                 return false;
             }
 
-            var json = ExtractJson(response);
-            if (!string.IsNullOrWhiteSpace(json))
+            action = actions[0];
+            return action != null;
+        }
+
+        private static List<ProtoAgentAction> ParseAgentActionsFromResponse(string response)
+        {
+            var actions = new List<ProtoAgentAction>();
+            if (string.IsNullOrWhiteSpace(response))
             {
-                action = TryParseAgentActionJson(json);
+                return actions;
+            }
+
+            var jsonObjects = ExtractJsonObjects(response);
+            foreach (var json in jsonObjects)
+            {
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    continue;
+                }
+
+                if (TryParseAgentActionFromJson(json, out var action))
+                {
+                    actions.Add(action);
+                    continue;
+                }
+            }
+
+            if (actions.Count == 0)
+            {
+                var fallbackInput = jsonObjects.Count == 0 ? response : jsonObjects[0];
+                if (TryParseAgentActionFallback(fallbackInput, out var fallback))
+                {
+                    actions.Add(fallback);
+                }
+            }
+
+            return actions;
+        }
+
+        private static bool TryParseAgentActionFromJson(string json, out ProtoAgentAction action)
+        {
+            action = null;
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return false;
+            }
+
+            action = TryParseAgentActionJson(json);
+            if (IsValidAgentAction(action))
+            {
+                return true;
+            }
+
+            var sanitized = SanitizeAgentJson(json);
+            if (!string.Equals(sanitized, json, StringComparison.Ordinal))
+            {
+                action = TryParseAgentActionJson(sanitized);
                 if (IsValidAgentAction(action))
                 {
                     return true;
                 }
-
-                var sanitized = SanitizeAgentJson(json);
-                if (!string.Equals(sanitized, json, StringComparison.Ordinal))
-                {
-                    action = TryParseAgentActionJson(sanitized);
-                    if (IsValidAgentAction(action))
-                    {
-                        return true;
-                    }
-                }
             }
 
-            var fallbackInput = string.IsNullOrWhiteSpace(json) ? response : json;
-            return TryParseAgentActionFallback(fallbackInput, out action);
+            if (TryParseSceneEditFromRawJson(json, out action))
+            {
+                return true;
+            }
+
+            if (!string.Equals(sanitized, json, StringComparison.Ordinal) &&
+                TryParseSceneEditFromRawJson(sanitized, out action))
+            {
+                return true;
+            }
+
+            return false;
         }
 
         private static ProtoAgentAction TryParseAgentActionJson(string json)
@@ -3570,7 +4701,42 @@ namespace ProtoTipAI.Editor
 
         private static bool IsValidAgentAction(ProtoAgentAction action)
         {
-            return action != null && !string.IsNullOrWhiteSpace(action.action);
+            if (action == null || string.IsNullOrWhiteSpace(action.action))
+            {
+                return false;
+            }
+
+            var normalized = NormalizeAgentActionName(action.action);
+            if (normalized != "scene_edit")
+            {
+                return true;
+            }
+
+            var edits = new List<ProtoSceneEditOperation>();
+            if (action.edits != null)
+            {
+                edits.AddRange(action.edits);
+            }
+
+            if (action.edit != null)
+            {
+                edits.Add(action.edit);
+            }
+
+            if (edits.Count == 0)
+            {
+                return false;
+            }
+
+            foreach (var edit in edits)
+            {
+                if (edit == null || string.IsNullOrWhiteSpace(edit.type))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private static string SanitizeAgentJson(string json)
@@ -3580,7 +4746,10 @@ namespace ProtoTipAI.Editor
                 return string.Empty;
             }
 
-            var cleaned = Regex.Replace(json, ",\\s*(\\}|\\])", "$1");
+            var cleaned = Regex.Replace(json, "\"[^\"]+\"\\s*:\\s*null\\s*,?", string.Empty);
+            cleaned = Regex.Replace(cleaned, "\"reference\"\\s*:\\s*\\[", "\"references\":[");
+            cleaned = Regex.Replace(cleaned, ",\\s*(\\}|\\])", "$1");
+            cleaned = Regex.Replace(cleaned, "\\{\\s*,", "{");
             if (cleaned.IndexOf('\"') < 0 && cleaned.IndexOf('\'') >= 0)
             {
                 cleaned = cleaned.Replace('\'', '\"');
@@ -4119,7 +5288,6 @@ namespace ProtoTipAI.Editor
         {
             _isSending = true;
             _status = "Reviewing script...";
-            _cancelRequested = false;
             var token = BeginOperation("review");
             _apiWaitTimeoutSeconds = 320;
 
@@ -4390,7 +5558,6 @@ namespace ProtoTipAI.Editor
         {
             _isGeneratingPlan = true;
             _toolStatus = "Generating plan...";
-            _cancelRequested = false;
             var token = BeginOperation("plan");
             _apiWaitTimeoutSeconds = 320;
             Repaint();
@@ -4531,7 +5698,6 @@ namespace ProtoTipAI.Editor
         {
             _isApplyingPlan = true;
             _toolStatus = "Applying feature requests...";
-            _cancelRequested = false;
             _lastFixPassTargets = null;
             _lastFixPassLabel = string.Empty;
             if (ownsOperation)
@@ -4630,7 +5796,6 @@ namespace ProtoTipAI.Editor
             _isFixingErrors = true;
             var labelSuffix = string.IsNullOrWhiteSpace(effectiveLabel) ? string.Empty : $" ({effectiveLabel})";
             _toolStatus = $"Fix pass{labelSuffix} running...";
-            _cancelRequested = false;
             _apiWaitTimeoutSeconds = 320;
             if (ownsOperation)
             {
@@ -4891,7 +6056,6 @@ namespace ProtoTipAI.Editor
         {
             _isApplyingStage = true;
             _toolStatus = $"Applying {label}...";
-            _cancelRequested = false;
             if (ownsOperation)
             {
                 Repaint();
@@ -11629,7 +12793,6 @@ namespace ProtoTipAI.Editor
             _operationCts?.Cancel();
             _operationCts?.Dispose();
             _operationCts = new CancellationTokenSource();
-            _cancelRequested = false;
             if (!string.IsNullOrWhiteSpace(label))
             {
                 _toolStatus = label;
@@ -11644,7 +12807,6 @@ namespace ProtoTipAI.Editor
                 _operationCts.Dispose();
                 _operationCts = null;
             }
-            _cancelRequested = false;
             ClearOperationProgress();
         }
 
@@ -11670,7 +12832,6 @@ namespace ProtoTipAI.Editor
             }
 
             _isCanceling = true;
-            _cancelRequested = true;
             _toolStatus = "Canceling...";
             if (_operationCts != null && !_operationCts.IsCancellationRequested)
             {
@@ -11738,7 +12899,6 @@ namespace ProtoTipAI.Editor
 
         private async Task ApplySingleRequestInternalAsync(ProtoFeatureRequest request)
         {
-            _cancelRequested = false;
             var token = BeginOperation("re-do");
             try
             {
@@ -11988,6 +13148,259 @@ namespace ProtoTipAI.Editor
             }
 
             return string.Empty;
+        }
+
+        private static List<string> ExtractJsonObjects(string text)
+        {
+            var results = new List<string>();
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return results;
+            }
+
+            var trimmed = text.Trim();
+            var fence = "```";
+            var startFence = trimmed.IndexOf(fence, StringComparison.Ordinal);
+            if (startFence >= 0)
+            {
+                var endFence = trimmed.IndexOf(fence, startFence + fence.Length, StringComparison.Ordinal);
+                if (endFence > startFence)
+                {
+                    var fenced = trimmed.Substring(startFence + fence.Length, endFence - (startFence + fence.Length));
+                    var newline = fenced.IndexOf('\n');
+                    if (newline >= 0)
+                    {
+                        fenced = fenced.Substring(newline + 1);
+                    }
+                    trimmed = fenced.Trim();
+                }
+            }
+
+            var depth = 0;
+            var start = -1;
+            var inString = false;
+            var escape = false;
+            for (var i = 0; i < trimmed.Length; i++)
+            {
+                var c = trimmed[i];
+                if (inString)
+                {
+                    if (escape)
+                    {
+                        escape = false;
+                        continue;
+                    }
+
+                    if (c == '\\')
+                    {
+                        escape = true;
+                        continue;
+                    }
+
+                    if (c == '"')
+                    {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inString = true;
+                    continue;
+                }
+
+                if (c == '{')
+                {
+                    if (depth == 0)
+                    {
+                        start = i;
+                    }
+                    depth++;
+                    continue;
+                }
+
+                if (c == '}' && depth > 0)
+                {
+                    depth--;
+                    if (depth == 0 && start >= 0)
+                    {
+                        var chunk = trimmed.Substring(start, i - start + 1).Trim();
+                        if (!string.IsNullOrWhiteSpace(chunk))
+                        {
+                            results.Add(chunk);
+                        }
+                        start = -1;
+                    }
+                }
+            }
+
+            return results;
+        }
+
+        private static bool TryParseSceneEditFromRawJson(string json, out ProtoAgentAction action)
+        {
+            action = null;
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return false;
+            }
+
+            var actionValue = ExtractLooseJsonStringValue(json, "action");
+            if (!string.Equals(NormalizeAgentActionName(actionValue), "scene_edit", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var edits = ExtractSceneEditsFromJson(json);
+            if (edits.Count == 0)
+            {
+                return false;
+            }
+
+            action = new ProtoAgentAction
+            {
+                action = actionValue,
+                scene = ExtractLooseJsonStringValue(json, "scene"),
+                path = ExtractLooseJsonStringValue(json, "path"),
+                edits = edits.ToArray()
+            };
+
+            return IsValidAgentAction(action);
+        }
+
+        private static List<ProtoSceneEditOperation> ExtractSceneEditsFromJson(string json)
+        {
+            var edits = new List<ProtoSceneEditOperation>();
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return edits;
+            }
+
+            if (TryExtractJsonSegment(json, "edits", '[', ']', out var arraySegment))
+            {
+                var inner = arraySegment.Length > 2 ? arraySegment.Substring(1, arraySegment.Length - 2) : string.Empty;
+                var editObjects = ExtractJsonObjects(inner);
+                foreach (var editJson in editObjects)
+                {
+                    var sanitized = SanitizeAgentJson(editJson);
+                    var edit = TryParseSceneEditOperationJson(sanitized);
+                    if (edit != null)
+                    {
+                        edits.Add(edit);
+                    }
+                }
+            }
+
+            if (edits.Count == 0 && TryExtractJsonSegment(json, "edit", '{', '}', out var editSegment))
+            {
+                var sanitized = SanitizeAgentJson(editSegment);
+                var edit = TryParseSceneEditOperationJson(sanitized);
+                if (edit != null)
+                {
+                    edits.Add(edit);
+                }
+            }
+
+            return edits;
+        }
+
+        private static ProtoSceneEditOperation TryParseSceneEditOperationJson(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return null;
+            }
+
+            var sanitized = SanitizeAgentJson(json);
+            try
+            {
+                return JsonUtility.FromJson<ProtoSceneEditOperation>(sanitized);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool TryExtractJsonSegment(string json, string key, char openChar, char closeChar, out string segment)
+        {
+            segment = string.Empty;
+            if (string.IsNullOrWhiteSpace(json) || string.IsNullOrWhiteSpace(key))
+            {
+                return false;
+            }
+
+            var pattern = $"(?i)\\\"{Regex.Escape(key)}\\\"\\s*:\\s*\\{openChar}";
+            var match = Regex.Match(json, pattern);
+            if (!match.Success)
+            {
+                return false;
+            }
+
+            var start = match.Index + match.Length - 1;
+            var end = FindMatchingBracket(json, start, openChar, closeChar);
+            if (end < 0 || end <= start)
+            {
+                return false;
+            }
+
+            segment = json.Substring(start, end - start + 1);
+            return true;
+        }
+
+        private static int FindMatchingBracket(string text, int startIndex, char openChar, char closeChar)
+        {
+            var depth = 0;
+            var inString = false;
+            var escape = false;
+            for (var i = startIndex; i < text.Length; i++)
+            {
+                var c = text[i];
+                if (inString)
+                {
+                    if (escape)
+                    {
+                        escape = false;
+                        continue;
+                    }
+
+                    if (c == '\\')
+                    {
+                        escape = true;
+                        continue;
+                    }
+
+                    if (c == '"')
+                    {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inString = true;
+                    continue;
+                }
+
+                if (c == openChar)
+                {
+                    depth++;
+                    continue;
+                }
+
+                if (c == closeChar && depth > 0)
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        return i;
+                    }
+                }
+            }
+
+            return -1;
         }
 
         private static string NormalizePlanJson(string json)
@@ -14102,12 +15515,14 @@ namespace ProtoTipAI.Editor
         {
             public string type;
             public string name;
+            public string primitive;
             public string parent;
             public string prefab;
             public string component;
             public string field;
             public string value;
             public string reference;
+            public string[] references;
             public string lightType;
             public float intensity;
             public float range;

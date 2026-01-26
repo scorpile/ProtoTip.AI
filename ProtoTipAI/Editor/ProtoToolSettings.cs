@@ -6,6 +6,7 @@ namespace ProtoTipAI.Editor
     {
         private const string AutoConfirmKey = "ProtoTipAI.Tools.AutoConfirm";
         private const string FullAgentKey = "ProtoTipAI.Tools.FullAgent";
+        private const string AgentDebugCaptureKey = "ProtoTipAI.Tools.AgentDebugCapture";
 
         public static bool GetAutoConfirm()
         {
@@ -25,6 +26,16 @@ namespace ProtoTipAI.Editor
         public static void SetFullAgentMode(bool value)
         {
             EditorPrefs.SetBool(FullAgentKey, value);
+        }
+
+        public static bool GetAgentDebugCapture()
+        {
+            return EditorPrefs.GetBool(AgentDebugCaptureKey, false);
+        }
+
+        public static void SetAgentDebugCapture(bool value)
+        {
+            EditorPrefs.SetBool(AgentDebugCaptureKey, value);
         }
     }
 }

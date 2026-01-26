@@ -28,6 +28,7 @@ namespace ProtoTipAI.Editor
         private string _customBaseUrl;
         private bool _autoConfirmTools;
         private bool _fullAgentMode;
+        private bool _agentDebugCapture;
         private Vector2 _projectGoalScroll;
         private Vector2 _projectSummaryScroll;
         private static GUIStyle _multiLineStyle;
@@ -73,6 +74,7 @@ namespace ProtoTipAI.Editor
             _customBaseUrl = ProtoProviderSettings.GetCustomBaseUrl();
             _autoConfirmTools = ProtoToolSettings.GetAutoConfirm();
             _fullAgentMode = ProtoToolSettings.GetFullAgentMode();
+            _agentDebugCapture = ProtoToolSettings.GetAgentDebugCapture();
         }
 
         private void OnGUI()
@@ -110,11 +112,16 @@ namespace ProtoTipAI.Editor
                 _fullAgentMode = EditorGUILayout.ToggleLeft(
                     "Full agent mode (skip stage confirmations)",
                     _fullAgentMode);
+                _agentDebugCapture = EditorGUILayout.ToggleLeft(
+                    "Capture agent debug log",
+                    _agentDebugCapture);
                 if (_fullAgentMode)
                 {
                     _autoConfirmTools = true;
                 }
-                EditorGUILayout.HelpBox("When disabled, Unity asks before tool operations modify files. Full agent mode keeps stage/apply confirmations off.", MessageType.Info);
+                EditorGUILayout.HelpBox(
+                    "When disabled, Unity asks before tool operations modify files. Full agent mode keeps stage/apply confirmations off. Debug capture logs prompts, responses, and tool actions to Assets/Plan/ChatSessions/Debug.",
+                    MessageType.Info);
             }
 
             EditorGUILayout.Space(6f);
@@ -159,6 +166,7 @@ namespace ProtoTipAI.Editor
                     ProtoProjectSettings.SetProjectSummary(_projectSummary);
                     ProtoToolSettings.SetAutoConfirm(_autoConfirmTools);
                     ProtoToolSettings.SetFullAgentMode(_fullAgentMode);
+                    ProtoToolSettings.SetAgentDebugCapture(_agentDebugCapture);
                     Close();
                 }
             }

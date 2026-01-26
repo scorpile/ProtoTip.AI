@@ -26,12 +26,13 @@ namespace ProtoTipAI.Editor
 
         public static ProtoAgentRequestStatus ToStatus(this string? value)
         {
-            if (string.IsNullOrWhiteSpace(value))
+            var normalized = value?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(normalized))
             {
                 return ProtoAgentRequestStatus.Todo;
             }
 
-            return value.Trim().ToLowerInvariant() switch
+            return normalized.ToLowerInvariant() switch
             {
                 "in_progress" => ProtoAgentRequestStatus.InProgress,
                 "done" => ProtoAgentRequestStatus.Done,

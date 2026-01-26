@@ -108,13 +108,19 @@ namespace ProtoTipAI.Editor
             "Use the available tools; do not ask the user to open files, copy logs, or run searches. " +
             "If you need more context, use read_file, list_folder, or search_text. Prefer small, verifiable steps. " +
             "Use scene_edit to adjust Unity scenes (prefabs, components, lights, transforms, objects) when needed. " +
+            "For add_gameobject primitives, set \"primitive\" to cube, sphere, capsule, cylinder, plane, or quad. " +
+            "For array fields in set_component_field, provide \"reference\" as a list of scene object names. " +
+            "If the user request contains multiple tasks, list them mentally and execute them in order. " +
+            "After each tool call, verify whether that task is completed; if all tasks are done, respond/stop. " +
+            "Never send scene_edit with empty edits or missing edit type. Every edit must include a non-empty type. " +
+            "If you cannot produce a valid edit, use respond/stop instead of sending empty edits. " +
             "Do not repeat the same tool call with identical parameters; if a file was truncated, request a line range.";
 
         public const string AgentLoopToolSchema =
             "Return ONLY JSON: {\"action\":\"read_file|write_file|list_folder|search_text|apply_plan|apply_stage|fix_pass|scene_edit|respond|stop\"," +
             "\"path\":\"optional\",\"content\":\"optional\",\"query\":\"optional\",\"stage\":\"optional\",\"scope\":\"optional\",\"message\":\"optional\"," +
             "\"scene\":\"optional\",\"edits\":[{\"type\":\"add_light|set_light|add_gameobject|add_prefab|add_component|set_component_field|set_transform|delete_object\"," +
-            "\"name\":\"optional\",\"parent\":\"optional\",\"prefab\":\"optional\",\"component\":\"optional\",\"field\":\"optional\",\"value\":\"optional\",\"reference\":\"optional\"," +
+            "\"name\":\"optional\",\"primitive\":\"cube|sphere|capsule|cylinder|plane|quad\",\"parent\":\"optional\",\"prefab\":\"optional\",\"component\":\"optional\",\"field\":\"optional\",\"value\":\"optional\",\"reference\":\"optional\"," +
             "\"lightType\":\"spot|point|directional|area\",\"intensity\":0,\"range\":0,\"spotAngle\":0," +
             "\"position\":[0,0,0],\"rotation\":[0,0,0],\"scale\":[1,1,1],\"offset\":[0,0,0],\"target\":\"optional\",\"vector\":[0,0,0],\"color\":[1,1,1]}]," +
             "\"lineStart\":0,\"lineEnd\":0,\"range\":\"optional\"}. " +
@@ -124,6 +130,7 @@ namespace ProtoTipAI.Editor
             "Use apply_stage stage values: folders|scripts|materials|prefabs|scenes|assets. " +
             "Use fix_pass scope: last_stage|all. " +
             "Use scene_edit with scene path or scene name in \"scene\" and one or more edits. " +
+            "For scene_edit, edits must be a non-empty array and each edit must include a non-empty type. Do not send empty {}. " +
             "Use respond when you are done and want to summarize. Use stop to end without changes.";
 
         public const string AgentLoopGoalFormat = "Goal: {0}";

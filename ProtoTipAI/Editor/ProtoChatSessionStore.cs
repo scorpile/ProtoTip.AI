@@ -37,6 +37,7 @@ namespace ProtoTipAI.Editor
     {
         private const string SessionFolder = "Assets/Plan/ChatSessions";
         private const string SessionIndexFile = "ChatSessions.json";
+        private const string DebugFolder = "Assets/Plan/ChatSessions/Debug";
 
         public static string EnsureSessionFolder()
         {
@@ -55,6 +56,13 @@ namespace ProtoTipAI.Editor
             EnsureSessionFolder();
             var safeId = string.IsNullOrWhiteSpace(sessionId) ? Guid.NewGuid().ToString("N") : sessionId.Trim();
             return $"{SessionFolder}/{safeId}.json";
+        }
+
+        public static string GetDebugLogPath(string sessionId)
+        {
+            ProtoAssetUtility.TryEnsureFolder(DebugFolder, out var normalized, out _);
+            var safeId = string.IsNullOrWhiteSpace(sessionId) ? Guid.NewGuid().ToString("N") : sessionId.Trim();
+            return $"{normalized}/{safeId}.log";
         }
 
         public static List<ProtoChatSessionInfo> LoadSessionIndex()
