@@ -105,22 +105,40 @@ namespace ProtoTipAI.Editor
 
         public const string AgentLoopSystemInstruction =
             "You are an autonomous Unity agent operating inside ProtoTip. Decide the next single action that moves the goal forward. " +
+            "Always follow the provided subgoals; only work on the current subgoal and stop when it is done. " +
+            "Ignore unrelated project systems or plans; the current subgoal overrides any existing project goal. " +
+            "Do not inspect or modify unrelated scripts (e.g., enemy/wave systems) unless the subgoal explicitly mentions them. " +
+            "Avoid broad searches across Assets; limit list/search to Assets/Project or the target scene folder unless the subgoal says otherwise. " +
             "Use the available tools; do not ask the user to open files, copy logs, or run searches. " +
             "If you need more context, use read_file, list_folder, or search_text. Prefer small, verifiable steps. " +
             "Use scene_edit to adjust Unity scenes (prefabs, components, lights, transforms, objects) when needed. " +
+            "Use scene_query to inspect the scene, find objects by name/component, and discover settable fields before editing. " +
+            "Use scene_create to create a new scene when the target scene does not exist. " +
+            "Use prefab_query to find prefab paths by name before add_prefab when needed. " +
             "For add_gameobject primitives, set \"primitive\" to cube, sphere, capsule, cylinder, plane, or quad. " +
-            "For array fields in set_component_field, provide \"reference\" as a list of scene object names. " +
+            "Use set_parent for parent/child, set_tag/set_layer for tags and layers, duplicate_object to clone, and set_component_reference for references by name. " +
+            "For array fields in set_component_field/set_component_reference, provide \"references\" as a list of scene object names. " +
             "If the user request contains multiple tasks, list them mentally and execute them in order. " +
             "After each tool call, verify whether that task is completed; if all tasks are done, respond/stop. " +
             "Never send scene_edit with empty edits or missing edit type. Every edit must include a non-empty type. " +
             "If you cannot produce a valid edit, use respond/stop instead of sending empty edits. " +
-            "Do not repeat the same tool call with identical parameters; if a file was truncated, request a line range.";
+            "Do not repeat the same tool call with identical parameters; if a file was truncated, request a line range. " +
+            "If a scene_edit result says it is verified or deferred pending script compile, do not retry the same edit immediately.";
+
+        public const string AgentGoalDecompositionInstruction =
+            "You are a planning assistant for a Unity editor agent. Break the goal into 2-6 small, verifiable subgoals. " +
+            "Each subgoal must be a single clear action that can be completed before moving to the next. " +
+            "Keep them short and ordered. Avoid implementation detail and avoid optional text.";
+
+        public const string AgentGoalDecompositionSchema =
+            "Return ONLY JSON: {\"steps\":[\"subgoal 1\",\"subgoal 2\"]}. " +
+            "No Markdown, no extra text, no numbering.";
 
         public const string AgentLoopToolSchema =
-            "Return ONLY JSON: {\"action\":\"read_file|write_file|list_folder|search_text|apply_plan|apply_stage|fix_pass|scene_edit|respond|stop\"," +
-            "\"path\":\"optional\",\"content\":\"optional\",\"query\":\"optional\",\"stage\":\"optional\",\"scope\":\"optional\",\"message\":\"optional\"," +
-            "\"scene\":\"optional\",\"edits\":[{\"type\":\"add_light|set_light|add_gameobject|add_prefab|add_component|set_component_field|set_transform|delete_object\"," +
-            "\"name\":\"optional\",\"primitive\":\"cube|sphere|capsule|cylinder|plane|quad\",\"parent\":\"optional\",\"prefab\":\"optional\",\"component\":\"optional\",\"field\":\"optional\",\"value\":\"optional\",\"reference\":\"optional\"," +
+            "Return ONLY JSON: {\"action\":\"read_file|write_file|list_folder|search_text|apply_plan|apply_stage|fix_pass|scene_edit|scene_query|scene_create|prefab_query|respond|stop\"," +
+            "\"path\":\"optional\",\"content\":\"optional\",\"query\":\"optional\",\"name\":\"optional\",\"component\":\"optional\",\"limit\":0,\"stage\":\"optional\",\"scope\":\"optional\",\"message\":\"optional\"," +
+            "\"scene\":\"optional\",\"edits\":[{\"type\":\"add_light|set_light|add_gameobject|add_prefab|add_component|set_component_field|set_component_reference|set_transform|set_parent|set_tag|set_layer|duplicate_object|delete_object\"," +
+            "\"name\":\"optional\",\"primitive\":\"cube|sphere|capsule|cylinder|plane|quad\",\"parent\":\"optional\",\"prefab\":\"optional\",\"component\":\"optional\",\"field\":\"optional\",\"value\":\"optional\",\"reference\":\"optional\",\"references\":[\"optional\"]," +
             "\"lightType\":\"spot|point|directional|area\",\"intensity\":0,\"range\":0,\"spotAngle\":0," +
             "\"position\":[0,0,0],\"rotation\":[0,0,0],\"scale\":[1,1,1],\"offset\":[0,0,0],\"target\":\"optional\",\"vector\":[0,0,0],\"color\":[1,1,1]}]," +
             "\"lineStart\":0,\"lineEnd\":0,\"range\":\"optional\"}. " +
@@ -131,6 +149,9 @@ namespace ProtoTipAI.Editor
             "Use fix_pass scope: last_stage|all. " +
             "Use scene_edit with scene path or scene name in \"scene\" and one or more edits. " +
             "For scene_edit, edits must be a non-empty array and each edit must include a non-empty type. Do not send empty {}. " +
+            "Use scene_query to inspect a scene; optionally set \"scene\", \"name\" (or \"query\") and/or \"component\", and \"limit\". " +
+            "Use scene_create to create a new scene; set \"scene\" (or \"path\"/\"name\"). " +
+            "Use prefab_query to search prefabs by name; set \"name\" (or \"query\") and \"limit\". " +
             "Use respond when you are done and want to summarize. Use stop to end without changes.";
 
         public const string AgentLoopGoalFormat = "Goal: {0}";

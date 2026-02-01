@@ -7,12 +7,18 @@ namespace ProtoTipAI.Editor
         private const string AutoConfirmKey = "ProtoTipAI.Tools.AutoConfirm";
         private const string FullAgentKey = "ProtoTipAI.Tools.FullAgent";
         private const string AgentDebugCaptureKey = "ProtoTipAI.Tools.AgentDebugCapture";
+        private const string ForceGoalDecompositionKey = "ProtoTipAI.Agent.ForceGoalDecomposition";
 
         static ProtoToolSettings()
         {
             if (!EditorPrefs.HasKey(AgentDebugCaptureKey))
             {
                 EditorPrefs.SetBool(AgentDebugCaptureKey, false);
+            }
+
+            if (!EditorPrefs.HasKey(ForceGoalDecompositionKey))
+            {
+                EditorPrefs.SetBool(ForceGoalDecompositionKey, true);
             }
         }
 
@@ -44,6 +50,16 @@ namespace ProtoTipAI.Editor
         public static void SetAgentDebugCapture(bool value)
         {
             EditorPrefs.SetBool(AgentDebugCaptureKey, value);
+        }
+
+        public static bool GetForceGoalDecomposition()
+        {
+            return EditorPrefs.GetBool(ForceGoalDecompositionKey, true);
+        }
+
+        public static void SetForceGoalDecomposition(bool value)
+        {
+            EditorPrefs.SetBool(ForceGoalDecompositionKey, value);
         }
     }
 }

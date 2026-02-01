@@ -29,6 +29,7 @@ namespace ProtoTipAI.Editor
         private bool _autoConfirmTools;
         private bool _fullAgentMode;
         private bool _agentDebugCapture;
+        private bool _forceGoalDecomposition;
         private Vector2 _projectGoalScroll;
         private Vector2 _projectSummaryScroll;
         private static GUIStyle _multiLineStyle;
@@ -75,6 +76,7 @@ namespace ProtoTipAI.Editor
             _autoConfirmTools = ProtoToolSettings.GetAutoConfirm();
             _fullAgentMode = ProtoToolSettings.GetFullAgentMode();
             _agentDebugCapture = ProtoToolSettings.GetAgentDebugCapture();
+            _forceGoalDecomposition = ProtoToolSettings.GetForceGoalDecomposition();
         }
 
         private void OnGUI()
@@ -112,6 +114,9 @@ namespace ProtoTipAI.Editor
                 _fullAgentMode = EditorGUILayout.ToggleLeft(
                     "Full agent mode (skip stage confirmations)",
                     _fullAgentMode);
+                _forceGoalDecomposition = EditorGUILayout.ToggleLeft(
+                    "Force goal decomposition (subgoals)",
+                    _forceGoalDecomposition);
                 _agentDebugCapture = EditorGUILayout.ToggleLeft(
                     "Capture agent debug log",
                     _agentDebugCapture);
@@ -120,7 +125,7 @@ namespace ProtoTipAI.Editor
                     _autoConfirmTools = true;
                 }
                 EditorGUILayout.HelpBox(
-                    "When disabled, Unity asks before tool operations modify files. Full agent mode keeps stage/apply confirmations off. Debug capture logs prompts, responses, and tool actions to Assets/Plan/ChatSessions/Debug.",
+                    "When disabled, Unity asks before tool operations modify files. Full agent mode keeps stage/apply confirmations off. Goal decomposition splits tasks into subgoals before acting. Debug capture logs prompts, responses, and tool actions to Assets/Plan/ChatSessions/Debug.",
                     MessageType.Info);
             }
 
@@ -167,6 +172,7 @@ namespace ProtoTipAI.Editor
                     ProtoToolSettings.SetAutoConfirm(_autoConfirmTools);
                     ProtoToolSettings.SetFullAgentMode(_fullAgentMode);
                     ProtoToolSettings.SetAgentDebugCapture(_agentDebugCapture);
+                    ProtoToolSettings.SetForceGoalDecomposition(_forceGoalDecomposition);
                     Close();
                 }
             }
